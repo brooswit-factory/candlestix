@@ -20,8 +20,8 @@ no "Done." That is the whole reason it is a separate product from `butchr`
 ## Status
 
 Foundation stage. This repo currently has a scaffold and a minimal
-entrypoint that starts up, logs, and shuts down cleanly on `SIGINT` /
-`SIGTERM` — it does not yet keep any agents alive. The roster, the
+entrypoint that starts up, logs, stays running, and shuts down cleanly on
+`SIGINT` / `SIGTERM` — it does not yet keep any agents alive. The roster, the
 health/heartbeat components, and the supervisor loop that actually make it a
 daemon are separate, later stories.
 
