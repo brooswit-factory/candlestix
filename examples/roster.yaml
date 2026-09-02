@@ -31,3 +31,11 @@ agents:
           - "@modelcontextprotocol/server-github"
         env:
           GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      # An http/sse server: `url` instead of `command`. Keys candlestix
+      # does not recognise (`type`, `headers`) are passed through to the
+      # agent untouched rather than rejected.
+      internal-tools:
+        type: http
+        url: https://mcp.example.internal/mcp
+        headers:
+          Authorization: "Bearer ${INTERNAL_TOKEN}"
