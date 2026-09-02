@@ -1,0 +1,33 @@
+# Example candlestix roster.
+#
+# Top level is a mapping with a single key, `agents`, whose value is a list
+# of agent entries. Every entry needs all four fields below — there are no
+# defaults, and `mcpServers` must be written as `{}` explicitly when an
+# agent has none.
+#
+# This file is meant to be copied to $XDG_CONFIG_HOME/candlestix/roster.yaml
+# (or ~/.config/candlestix/roster.yaml) and edited in place — see the
+# README's "Roster" section for the full field and validation reference.
+
+agents:
+  - name: release-notes
+    # `job` is the brief handed to the agent when it is spawned. Written as
+    # a YAML block scalar (the `|`) so multi-line prose keeps its line
+    # breaks instead of being hand-escaped into one line.
+    job: |
+      Watch this repo's merged PRs since the last tagged release and keep a
+      running draft of release notes in CHANGELOG.unreleased.md.
+
+      Group entries under Added / Changed / Fixed, in that order, and use
+      the PR title as the starting point for each line rather than the raw
+      commit message. Ask before removing anything a human already edited
+      by hand.
+    cwd: /home/operator/code/brooswit-factory/candlestix
+    mcpServers:
+      github:
+        command: npx
+        args:
+          - "-y"
+          - "@modelcontextprotocol/server-github"
+        env:
+          GITHUB_TOKEN: "${GITHUB_TOKEN}"
