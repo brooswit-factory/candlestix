@@ -1,0 +1,30 @@
+[Unit]
+Description=candlestix — supervisor for always-on blank agents
+After=default.target
+
+[Service]
+Type=simple
+# %h expands to the invoking user's home directory. bun and claude are
+# commonly installed outside the systemd user manager's default PATH (see
+# the ticket's own §12: on the investigated host, bun lived at
+# ~/.bun/bin/bun and was NOT on the default PATH) — a unit's PATH is not
+# your login shell's, so this is spelled out explicitly rather than
+# assumed inherited.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.bun/bin/bun run %h/code/brooswit-factory/candlestix/src/index.ts
+Restart=on-failure
+RestartSec=5
+
+# Deliberately the default (control-group), not overridden. Every agent
+# candlestix spawns runs inside its OWN `systemd-run --user --scope`
+# (see src/spawn.ts) — a separate, sibling cgroup under app.slice, never a
+# descendant of THIS unit's cgroup — so a stop/restart of this unit only
+# ever touches candlestix's own process, never a spawned agent's. This was
+# verified empirically, not assumed: see the PR description for the
+# before/after cgroup inspection. KillMode=process was considered and
+# rejected as unnecessary once the scope-per-agent design was confirmed to
+# already have this property structurally.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
