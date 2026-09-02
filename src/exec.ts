@@ -18,9 +18,12 @@ export interface RunCommandOptions {
 /**
  * Runs `argv[0]` with `argv.slice(1)` as arguments. On timeout, kills the
  * process and rejects — this is what stands between one hung `claude`/
- * `systemd-run` invocation and the whole reconcile cycle stalling forever,
- * since every agent is reconciled concurrently (see supervisor.ts) and a
- * per-agent await must have a bound.
+ * `systemd-run` invocation and the whole reconcile cycle stalling forever.
+ * `supervisor.ts` reconciles agents sequentially, deliberately (see its own
+ * comment for why), which makes this timeout load-bearing rather than
+ * incidental: a hung invocation for one agent would otherwise block every
+ * later agent in the same cycle, precisely because nothing else is running
+ * concurrently to make progress in the meantime.
  */
 export async function runCommand(argv: string[], options: RunCommandOptions): Promise<CommandResult> {
   const [cmd, ...args] = argv;

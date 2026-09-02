@@ -71,7 +71,7 @@ describe("decideReconcileAction — the false-healthy paths this ticket says to 
     expect(action.type).toBe("wait");
   });
 
-  test("registry points at a session no longer listed, but cwd-adoption finds a different live one -> heartbeat (registry self-heals)", () => {
+  test("registry points at a session no longer listed, but cwd-adoption finds a different live one -> heartbeat (registry self-heals), with the NEW session's own spawnedAt — never the dead predecessor's", () => {
     const staleRegistryEntry: RegistryEntry = { ...registryEntry, id: "dead-id", sessionId: "dead-session" };
     const action = decideReconcileAction({
       ...baseInputs,
@@ -81,8 +81,31 @@ describe("decideReconcileAction — the false-healthy paths this ticket says to 
     });
     expect(action).toEqual({
       type: "heartbeat",
-      entry: { name: "release-notes", id: bgAgent.id, sessionId: bgAgent.sessionId, cwd: bgAgent.cwd, spawnedAt: staleRegistryEntry.spawnedAt },
+      entry: {
+        name: "release-notes",
+        id: bgAgent.id,
+        sessionId: bgAgent.sessionId,
+        cwd: bgAgent.cwd,
+        spawnedAt: new Date(bgAgent.startedAt).toISOString(), // NOT staleRegistryEntry.spawnedAt — different session
+      },
     });
+  });
+
+  test("a fresh spawn that replaced a genuinely-ended session gets its OWN spawnedAt, not the dead predecessor's, even though a registry entry for the name still exists", () => {
+    const deadPredecessor: RegistryEntry = { ...registryEntry, sessionId: "a-session-that-ended-long-ago", spawnedAt: "2020-01-01T00:00:00.000Z" };
+    const freshSession: BackgroundAgentInfo = { ...bgAgent, sessionId: "brand-new-session", startedAt: 5000, pid: 99 };
+    const action = decideReconcileAction({
+      ...baseInputs,
+      registryEntry: deadPredecessor,
+      backgroundAgents: [freshSession],
+      verifiedAlivePids: new Set([99]),
+    });
+    expect(action.type).toBe("heartbeat");
+    if (action.type === "heartbeat") {
+      expect(action.entry.sessionId).toBe("brand-new-session");
+      expect(action.entry.spawnedAt).toBe(new Date(5000).toISOString());
+      expect(action.entry.spawnedAt).not.toBe(deadPredecessor.spawnedAt);
+    }
   });
 
   test("no registry entry at all, but a live session already exists at this cwd -> adopt it, never spawn a duplicate", () => {

@@ -15,6 +15,21 @@ import type { RegistryEntry } from "./registry";
 // `claude agents --json`" alone is deliberately NOT sufficient — see
 // `verifiedAlivePids` below and `agents-cli.ts`'s doc comment for the real,
 // observed reason.
+//
+// DELIBERATE DECISION: the `wait` action (below) is unbounded — there is no
+// consecutive-cycle counter, no escalation to `spawn` after N cycles of
+// `wait`. A candidate that stays listed without a verifiable pid blocks
+// `spawn` for that roster entry indefinitely. This was considered, not
+// merely left unexamined: the alternative (falling through to `spawn`
+// after some bound) can spawn a genuine duplicate next to a session that
+// was never actually dead, only slow to re-verify — which is a strictly
+// worse failure than staying stuck, because it silently creates two
+// background sessions for one roster entry instead of loudly reporting
+// zero. `wait` never fabricates health: the heartbeat stops, the subject
+// goes `stale` (health/staleness.ts), and `startStalenessAlarm` gets loud
+// on its own — exactly the mechanism this product already has for "an
+// operator needs to look at this," used here instead of guessing. See
+// README "Known gaps" for the same reasoning in operator-facing terms.
 
 export interface ReconcileInputs {
   agentName: string;
@@ -26,13 +41,19 @@ export interface ReconcileInputs {
   /**
    * pids that the caller independently confirmed alive via `kill(pid, 0)`
    * (or equivalent) AT THE SAME MOMENT `backgroundAgents` was fetched.
-   * Note what this does and does not defend against: candlestix never
-   * carries a pid across a reconcile cycle, so there is no stale-pid-across
-   * a-restart risk to guard against here — this check only rules out a
-   * `pid` `claude`'s daemon *just* reported now being invalid within that
-   * same instant (e.g. a race in its own bookkeeping), which is weaker
-   * than pid+start-time pairing but appropriate to what it is actually
-   * checking against.
+   *
+   * Two different claims, kept deliberately distinct (see the README's
+   * "The registry" section for the architecture-level version of this):
+   * as a per-check comparison against classic pid+start-time pairing, THIS
+   * CHECK ALONE is weaker — it only rules out a `pid` claude's daemon
+   * *just* reported now being invalid within that same instant (e.g. a
+   * race in its own bookkeeping), not a recycled pid observed later. But
+   * candlestix's ARCHITECTURE around this check is stronger than what
+   * pid+start-time pairing exists to fix: candlestix never carries a pid
+   * *across* a reconcile cycle in the first place (see "The registry" in
+   * the README), so the classic "recycled pid from an old cycle" failure
+   * this check's weaker cousin would need pairing to catch cannot arise
+   * here at all — there is no stale, candlestix-held pid to recycle.
    */
   verifiedAlivePids: ReadonlySet<number>;
   /** Whether `agentCwd` currently exists on disk, checked fresh this cycle. */
@@ -72,6 +93,16 @@ export function decideReconcileAction(inputs: ReconcileInputs): ReconcileAction 
 
   if (candidate) {
     if (candidate.pid !== undefined && inputs.verifiedAlivePids.has(candidate.pid)) {
+      // spawnedAt is carried forward from the registry ONLY when the
+      // candidate is genuinely the SAME session the registry already knew
+      // about (matched by sessionId) — never merely because a registry
+      // entry happened to exist for this name. A cwd-adoption match, or a
+      // fresh spawn that replaced a session the registry hadn't caught up
+      // to yet, is a DIFFERENT session under the same roster name, and
+      // must get its own spawnedAt (candidate.startedAt), not inherit a
+      // predecessor's. Getting this wrong would make the registry lie
+      // about how long the CURRENT process has actually been running.
+      const sameSessionAsRegistry = inputs.registryEntry?.sessionId === candidate.sessionId;
       return {
         type: "heartbeat",
         entry: {
@@ -79,7 +110,7 @@ export function decideReconcileAction(inputs: ReconcileInputs): ReconcileAction 
           id: candidate.id,
           sessionId: candidate.sessionId,
           cwd: candidate.cwd,
-          spawnedAt: inputs.registryEntry?.spawnedAt ?? new Date(candidate.startedAt).toISOString(),
+          spawnedAt: sameSessionAsRegistry ? inputs.registryEntry!.spawnedAt : new Date(candidate.startedAt).toISOString(),
         },
       };
     }

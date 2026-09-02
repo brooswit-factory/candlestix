@@ -326,9 +326,15 @@ adopts it instead of spawning a duplicate — the registry is safely
 reconstructable from `claude`'s own live state, by construction. This also
 means candlestix never carries a pid *across a reconcile cycle*: every
 cycle re-asks "what's alive right now" and only ever trusts a pid within
-the same instant it was reported, which is a stronger property than the
-usual "pid + start-time pairing to catch a recycled pid," not a weaker one
-— there is no stale, candlestix-held pid to recycle in the first place.
+the same instant it was reported. Two distinct claims, both true and worth
+keeping apart (see `src/reconcile.ts`'s doc comment on `verifiedAlivePids`
+for the same distinction at the code level): as a single check, this is
+*weaker* than pid+start-time pairing — it only rules out a pid that is
+already wrong the instant it was reported, not one that gets recycled
+later. But the *architecture* around it is stronger than what pid+start-time
+pairing exists to fix: there is no stale, candlestix-held pid sitting
+around *to* recycle in the first place, because none is ever carried
+between cycles.
 
 Written under `$XDG_RUNTIME_DIR` — survives a candlestix restart, not a
 reboot — matching this ticket's requirement exactly, since the agents
@@ -610,7 +616,27 @@ real, not hypothetical, on the actual target host.
   sessions happen to share the exact same `cwd`, `decideReconcileAction`'s
   cwd-adoption fallback adopts whichever one `claude agents --json`
   happens to list first. Not defended against further; roster `cwd`s are
-  expected to be distinct per agent in practice.
+  expected to be distinct per agent in practice. The mirror case is also
+  real and also not defended against: if *two roster entries* name the
+  same `cwd`, both would adopt the same live session and neither would
+  ever spawn — indistinguishable, from candlestix's side, from "working as
+  intended" until an operator notices only one agent exists for two names.
+- **The `wait` action is deliberately unbounded — this is a decision, not
+  an oversight.** When a candidate is listed by `claude agents --json` but
+  its `pid` cannot be independently verified this cycle (see "The
+  false-healthy trap this caught for real"), candlestix waits and tries
+  again next cycle, indefinitely — there is no consecutive-cycle counter
+  and no escalation to spawning a replacement. The alternative — falling
+  through to `spawn` after some bound of consecutive `wait`s — was
+  considered and rejected: it can create a genuine duplicate background
+  session next to one that was never actually dead, only slow to
+  re-verify, which is a strictly worse failure than staying stuck (it
+  silently doubles an agent instead of loudly reporting zero). `wait`
+  never fabricates health, either way: the heartbeat simply stops, the
+  subject goes `stale`, and `startStalenessAlarm` gets loud on its own —
+  the alarm, not a retry bound, is the intended operator-facing signal for
+  this state. See `src/reconcile.ts`'s doc comment for the same reasoning
+  at the code level.
 - **Nudge verification, startup-dialog answering (beyond the workspace-trust
   skip `--bg` already gets for free), and session-limit recognition are all
   out of scope**, per this ticket.

@@ -1,6 +1,10 @@
 [Unit]
 Description=candlestix — supervisor for always-on blank agents
-After=default.target
+# No `After=` line: `WantedBy=default.target` below (which pulls this unit
+# in when default.target is reached) already gives the ordering we need.
+# An `After=default.target` alongside that is a common but redundant
+# pattern for a user unit — default.target has no well-defined "before" set
+# to depend on — and was removed rather than left as unexamined boilerplate.
 
 [Service]
 Type=simple
