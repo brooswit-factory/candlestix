@@ -1,0 +1,30 @@
+{
+  "name": "candlestix",
+  "version": "0.0.0",
+  "description": "A daemon that keeps always-on, long-lived specialty agents alive: starts at boot, spawns blank agents, and you attach a terminal to tell one what to do",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brooswit-factory/candlestix.git"
+  },
+  "homepage": "https://github.com/brooswit-factory/candlestix#readme",
+  "bugs": {
+    "url": "https://github.com/brooswit-factory/candlestix/issues"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test && bun run build"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "bun": ">=1.1"
+  }
+}
