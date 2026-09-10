@@ -980,9 +980,20 @@ shown, live, on this story's own host:
   not retired. All of that is **CNDLX-19's**, by this ticket's own explicit
   instruction not to take it: do not rewrite `decideReconcileAction`, do
   not make the loop read the agent set, do not retire the roster.
-- **`attach` is not built.** Left a seam (`agent-session.ts`'s
-  `findAgentSessions` plus `claude attach <id>` is everything a future
-  implementation needs), per CNDLX-3's ownership of it.
+- **`attach` is not built.** Left a seam, per CNDLX-3's ownership of it —
+  and per R18 (arrived after this story was filed), that seam is shaped as
+  **one query, not an act**: resolve `<id-or-name>`, decide whether it is
+  attachable right now, return the live session identity — never "open a
+  terminal and attach," which is the caller's concern (a CLI execs in
+  place; a daemon-owned webapp path spawns a window), not candlestix
+  core's. `agent-session.ts`'s `findAgentSessions` already **is** that
+  query — R18 names it explicitly as the same lookup S2 already specifies,
+  one implementation for both callers, not a second. What this story does
+  NOT add: the attach-specific refusals R18 describes (an `off` or
+  `archived` agent has no session to attach to and would be refused, never
+  silently started) — no caller exists yet to refuse on behalf of, and
+  adding them here with no caller would be scope this ticket does not
+  claim.
 - **No CLI, no HTTP daemon API, no webapp** call any of this yet — CNDLX-15
   and CNDLX-16's scope. The action set (`agent-actions.ts`) is the seam
   they are meant to build on.
