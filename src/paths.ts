@@ -31,5 +31,10 @@ export function currentXdgInputs(): xdg.XdgInputs {
 export const rosterPath = (): string => xdg.rosterPath(currentXdgInputs());
 export const registryPath = (): string => xdg.registryPath(currentXdgInputs());
 export const healthSignalPath = (): string => xdg.healthSignalPath(currentXdgInputs());
-export const agentMcpConfigPath = (agentName: string): string => xdg.agentMcpConfigPath(currentXdgInputs(), agentName);
+/** CONDEMNED — see xdg.ts. Confined to the roster-driven spawn path. */
+export const legacyRosterMcpConfigPath = (agentName: string): string => xdg.legacyRosterMcpConfigPath(currentXdgInputs(), agentName);
+/** R16: id-keyed, id-validated. */
+export const agentMcpConfigPath = (agentId: string): string => xdg.agentMcpConfigPath(currentXdgInputs(), agentId);
 export const agentSetPath = (): string => xdg.agentSetPath(currentXdgInputs());
+export const agentsBaseDir = (): string => xdg.agentsBaseDir(currentXdgInputs());
+export const agentDirectoryPath = (agentId: string): string => xdg.agentDirectoryPath(currentXdgInputs(), agentId);

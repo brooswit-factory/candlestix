@@ -5,7 +5,7 @@ import { runCommand } from "./exec";
 import { createHeartbeatStore } from "./health/heartbeat";
 import { startStalenessAlarm } from "./health/alarm";
 import { startHealthSignalWriter } from "./health/signal";
-import { rosterPath, registryPath, healthSignalPath, agentMcpConfigPath } from "./paths";
+import { rosterPath, registryPath, healthSignalPath, legacyRosterMcpConfigPath } from "./paths";
 
 // This is candlestix's real cycle cadence, produced by this story (the
 // ticket names this as a "first" — staleness.ts's DEFAULT_STALENESS_THRESHOLD_MS
@@ -56,7 +56,7 @@ async function main(): Promise<void> {
       }
       await runReconcileCycle(rosterResult.roster, {
         registryPath: resolvedRegistryPath,
-        agentMcpConfigPath,
+        legacyRosterMcpConfigPath,
         runCommand,
         heartbeatStore,
       });
