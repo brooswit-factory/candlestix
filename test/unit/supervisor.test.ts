@@ -41,7 +41,7 @@ describe("runReconcileCycle", () => {
 
       await runReconcileCycle(roster, {
         registryPath: join(dir, "registry.json"),
-        agentMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
+        legacyRosterMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
         runCommand: async (argv) => {
           commands.push(argv);
           if (argv[0] === "claude" && argv[1] === "agents") {
@@ -67,7 +67,7 @@ describe("runReconcileCycle", () => {
 
       await runReconcileCycle(roster, {
         registryPath: join(dir, "registry.json"),
-        agentMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
+        legacyRosterMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
         runCommand: async () => ({
           exitCode: 0,
           stdout: JSON.stringify([{ id: "abc", sessionId: "abc-full", cwd, kind: "background", startedAt: Date.now(), pid: process.pid }]),
@@ -97,7 +97,7 @@ describe("runReconcileCycle", () => {
 
       await runReconcileCycle(roster, {
         registryPath: join(dir, "registry.json"),
-        agentMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
+        legacyRosterMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
         runCommand: async (argv, opts) => {
           if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
           spawnedFor.push(opts.cwd ?? "");
@@ -122,7 +122,7 @@ describe("runReconcileCycle", () => {
 
       await runReconcileCycle(roster, {
         registryPath: join(dir, "registry.json"),
-        agentMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
+        legacyRosterMcpConfigPath: (name) => join(dir, "mcp", `${name}.json`),
         runCommand: async (argv) => {
           if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 1, stdout: "", stderr: "not logged in" };
           spawnAttempted = true;

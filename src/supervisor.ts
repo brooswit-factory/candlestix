@@ -10,7 +10,13 @@ import { log } from "./log";
 
 export interface SupervisorOptions {
   registryPath: string;
-  agentMcpConfigPath: (agentName: string) => string;
+  /**
+   * CNDLX-23 / R16: named "legacy" deliberately — the roster's agents have
+   * no id, so this is the one remaining name-keyed per-agent path in the
+   * tree, confined to this roster-driven spawn path and retired by
+   * CNDLX-19 along with the roster itself. Do not add a second call site.
+   */
+  legacyRosterMcpConfigPath: (agentName: string) => string;
   runCommand: RunCommand;
   heartbeatStore: Pick<HeartbeatStore, "registerSubject" | "recordHeartbeat">;
   now?: () => Date;
@@ -65,7 +71,7 @@ async function reconcileOneAgent(
       );
       return registry;
     case "spawn": {
-      const result = await spawnBackgroundAgent(agent, options.agentMcpConfigPath(agent.name), { runCommand: options.runCommand });
+      const result = await spawnBackgroundAgent(agent, options.legacyRosterMcpConfigPath(agent.name), { runCommand: options.runCommand });
       if (!result.ok) {
         log("error", `"${agent.name}": spawn failed, no heartbeat recorded: ${result.error}`);
       } else {
