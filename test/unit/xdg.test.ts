@@ -88,13 +88,20 @@ describe("derived paths", () => {
     expect(() => agentMcpConfigPath(inputs, "release-notes")).toThrow();
   });
 
-  test("agentMcpConfigPath does not move when an agent is renamed — it never took a name in the first place", () => {
+  test("agentMcpConfigPath's path is a real function of its id argument — different ids give different paths", () => {
+    // Guards against the function silently ignoring its argument (e.g.
+    // returning a fixed path) — a test asserting `f(x) === f(x)` for a
+    // fixed `x` would pass even if it did. This function never takes a
+    // name at all, so "does it move on rename" isn't a question this pure
+    // layer can pose; the real, non-tautological proof that RENAMING AN
+    // AGENT does not move its MCP config path — an actual rename, with the
+    // path re-derived and asserted equal before/after — lives in
+    // `test/unit/agent-actions.test.ts`'s rename tests.
     const inputs = { ...base, runtimeDir: "/run/user/1000" };
-    const id = mintAgentId({ now: () => new Date(0), random: () => 0.5 });
-    // Renaming only ever changes an AgentRecord's `name` field, never its
-    // `id` — so calling this function again with the same id (the only
-    // input it accepts) always yields the same path, by construction.
-    expect(agentMcpConfigPath(inputs, id)).toBe(agentMcpConfigPath(inputs, id));
+    const idA = mintAgentId({ now: () => new Date(0), random: () => 0.5 });
+    const idB = mintAgentId({ now: () => new Date(1), random: () => 0.25 });
+    expect(idA).not.toBe(idB);
+    expect(agentMcpConfigPath(inputs, idA)).not.toBe(agentMcpConfigPath(inputs, idB));
   });
 
   test("agentsBaseDir and agentDirectoryPath (S1) live under the STATE home, one level below agents.json, keyed by id", () => {

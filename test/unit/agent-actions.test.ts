@@ -653,6 +653,33 @@ describe("a malformed store refuses EVERY action outright — never treated as e
     });
   });
 
+  test("createAgent refuses", async () => {
+    await withHarness(async ({ deps, agentSetPath }) => {
+      await corruptStore(agentSetPath);
+      const result = await createAgent(deps, { name: "whatever" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-malformed");
+    });
+  });
+
+  test("deleteAgent refuses", async () => {
+    await withHarness(async ({ deps, agentSetPath }) => {
+      await corruptStore(agentSetPath);
+      const result = await deleteAgent(deps, "@anything0000000000");
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-malformed");
+    });
+  });
+
+  test("listAgents refuses", async () => {
+    await withHarness(async ({ deps, agentSetPath }) => {
+      await corruptStore(agentSetPath);
+      const result = await listAgents(deps);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-malformed");
+    });
+  });
+
   test("none of the above ever call out to claude at all — refusal happens before any resolve/session step", async () => {
     await withHarness(async ({ deps, agentSetPath, commands }) => {
       await corruptStore(agentSetPath);
@@ -662,8 +689,149 @@ describe("a malformed store refuses EVERY action outright — never treated as e
       await unarchiveAgent(deps, "x");
       await renameAgent(deps, "x", "y");
       await deleteAgent(deps, "x");
+      await createAgent(deps, { name: "x" });
       await listAgents(deps);
       expect(commands).toEqual([]);
+    });
+  });
+});
+
+describe("a failed store WRITE is reported honestly, never an unhandled rejection (found in review, blocking)", () => {
+  async function withUnwritableStoreDir<T>(agentSetPath: string, fn: () => Promise<T>): Promise<T> {
+    const { chmod } = await import("node:fs/promises");
+    const storeDir = join(agentSetPath, "..");
+    await chmod(storeDir, 0o500); // r-x: readable/listable, not writable — the atomic write's temp file cannot be created
+    try {
+      return await fn();
+    } finally {
+      await chmod(storeDir, 0o700); // restore before the harness's own temp-dir cleanup runs
+    }
+  }
+
+  test("turnOff: the session is genuinely stopped, the write fails, and the caller gets a typed error — never a thrown rejection, and the store must NOT be left saying \"on\"", async () => {
+    await withHarness(async ({ deps, agentSetPath, liveSessions }) => {
+      const created = await createAgent(deps, { name: "write-fails-off" });
+      if (!created.ok) throw new Error("setup failed");
+      expect(liveSessions).toHaveLength(1);
+
+      const result = await withUnwritableStoreDir(agentSetPath, () => turnOff(deps, created.agent.id));
+
+      // The exact defect the review demonstrated: the effect must still have
+      // happened (the session really stopped)...
+      expect(liveSessions).toHaveLength(0);
+      // ...but the caller must get a typed error, never a thrown exception —
+      // this call already completed without throwing by the time we get here.
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.kind).toBe("store-write-failed");
+        if (result.error.kind === "store-write-failed") {
+          expect(result.error.error).toContain("session was stopped");
+        }
+      }
+
+      // And — the actual regression this guards against — the durable store
+      // on disk (permissions now restored) must NOT have been silently left
+      // saying "on": since the write never completed, it still holds
+      // whatever it held before this call, which is "on". A caller reading
+      // this typed error knows to treat the record as STALE; a caller that
+      // swallowed a thrown exception would not.
+      const loaded = await loadAgentSet(agentSetPath);
+      if (loaded.kind === "loaded") {
+        expect(loaded.agentSet.agents[created.agent.id]?.state).toBe("on");
+      }
+    });
+  });
+
+  test("turnOn: a write failure after a real spawn is reported, not thrown", async () => {
+    await withHarness(async ({ deps, agentSetPath, liveSessions }) => {
+      const created = await createAgent(deps, { name: "write-fails-on", initialState: "off" });
+      if (!created.ok) throw new Error("setup failed");
+
+      const result = await withUnwritableStoreDir(agentSetPath, () => turnOn(deps, created.agent.id));
+
+      expect(liveSessions).toHaveLength(1); // the session really started
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-write-failed");
+    });
+  });
+
+  test("archiveAgent: a write failure after stopping the session is reported, not thrown", async () => {
+    await withHarness(async ({ deps, agentSetPath, liveSessions }) => {
+      const created = await createAgent(deps, { name: "write-fails-archive" });
+      if (!created.ok) throw new Error("setup failed");
+
+      const result = await withUnwritableStoreDir(agentSetPath, () => archiveAgent(deps, created.agent.id));
+
+      expect(liveSessions).toHaveLength(0); // the session really stopped
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-write-failed");
+    });
+  });
+
+  test("unarchiveAgent: a write failure is reported, not thrown", async () => {
+    await withHarness(async ({ deps, agentSetPath }) => {
+      const created = await createAgent(deps, { name: "write-fails-unarchive", initialState: "off" });
+      if (!created.ok) throw new Error("setup failed");
+      await archiveAgent(deps, created.agent.id);
+
+      const result = await withUnwritableStoreDir(agentSetPath, () => unarchiveAgent(deps, created.agent.id));
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-write-failed");
+    });
+  });
+
+  test("renameAgent: a write failure is reported, not thrown", async () => {
+    await withHarness(async ({ deps, agentSetPath }) => {
+      const created = await createAgent(deps, { name: "write-fails-rename", initialState: "off" });
+      if (!created.ok) throw new Error("setup failed");
+
+      const result = await withUnwritableStoreDir(agentSetPath, () => renameAgent(deps, created.agent.id, "renamed"));
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-write-failed");
+    });
+  });
+
+  test("deleteAgent: the session and directory are really gone, the write fails, and the caller gets a typed error, not a thrown rejection", async () => {
+    await withHarness(async ({ deps, agentSetPath, agentsBaseDir, liveSessions }) => {
+      const created = await createAgent(deps, { name: "write-fails-delete" });
+      if (!created.ok) throw new Error("setup failed");
+
+      const result = await withUnwritableStoreDir(agentSetPath, () => deleteAgent(deps, created.agent.id));
+
+      expect(liveSessions).toHaveLength(0); // session really stopped+removed
+      await expect(stat(join(agentsBaseDir, created.agent.id))).rejects.toThrow(); // directory really gone
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-write-failed");
+
+      // A retry, now that permissions are restored, completes cleanly —
+      // every earlier step is idempotent, exactly as the module's own doc
+      // comment claims for a crash between steps.
+      const retry = await deleteAgent(deps, created.agent.id);
+      expect(retry).toEqual({ ok: true, outcome: { kind: "deleted" } });
+    });
+  });
+
+  test("createAgent: a write failure after directory+spawn rolls back (stops the session, removes the directory) rather than leaking an orphan no retry could ever find", async () => {
+    await withHarness(async ({ deps, agentSetPath, agentsBaseDir, liveSessions }) => {
+      // Pre-create the agents base dir (with normal permissions) so the new
+      // agent's OWN subdirectory can still be created under it once the
+      // store's parent directory is made read-only below — only the final
+      // `agents.json` write (which lives directly in that parent) should fail.
+      const { mkdir } = await import("node:fs/promises");
+      await mkdir(agentsBaseDir, { recursive: true });
+
+      const result = await withUnwritableStoreDir(agentSetPath, () => createAgent(deps, { name: "write-fails-create" }));
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("store-write-failed");
+
+      // Nothing was ever persisted (the write that failed was the only one attempted)...
+      const loaded = await loadAgentSet(agentSetPath);
+      expect(loaded.kind).toBe("missing");
+      // ...and the orphaned session and directory were rolled back rather than leaked.
+      expect(liveSessions).toHaveLength(0);
+      const { readdir } = await import("node:fs/promises");
+      expect(await readdir(agentsBaseDir).catch(() => [])).toEqual([]);
     });
   });
 });

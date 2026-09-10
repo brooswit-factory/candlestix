@@ -11,6 +11,19 @@
 // AFTER every effect has succeeded — so a failed effect never leaves the
 // durable store recording an intention this process just learned is false.
 // This is R9's split, applied uniformly.
+//
+// The REVERSE direction — effect succeeded, but the store write itself then
+// fails — is a distinct failure this module also owns honestly rather than
+// leaving as an unhandled rejection: every `saveAgentSet` call is wrapped
+// (`saveOrReportFailure` below) and reported as a typed `store-write-failed`
+// member on the same error union every other failure uses, naming exactly
+// which effect already happened (a session was stopped/started, a name was
+// changed, ...) so the caller knows reality and the durable store may now
+// disagree. This was found live, by review, not by reasoning: a `turnOff`
+// whose session-stop effect succeeds and whose write then throws left the
+// store recording `"on"` for an agent whose session was genuinely stopped —
+// exactly the state CNDLX-19's reconcile loop must never see, since it would
+// read "on" and respawn an agent the operator just turned off.
 
 import type { AgentLifecycleState, AgentRecord } from "./agent";
 import { checkAgentNameAllowed, decideArchive, decideDelete, decideOff, decideOn, decideUnarchive } from "./agent-lifecycle";
@@ -41,6 +54,40 @@ export type SessionLookupTrouble = { kind: "session-lookup-failed"; error: strin
 
 /** A resolved session was found but could not be stopped/removed — never silently ignored. */
 export type SessionCleanupTrouble = { kind: "session-cleanup-failed"; failed: Array<{ id: string; error: string }> };
+
+/**
+ * The store write itself failed AFTER every effect already succeeded. The
+ * message names what already happened (`effectDescription`) so the caller
+ * knows precisely how reality and the durable store may now disagree —
+ * this is never swallowed and never left as an unhandled rejection.
+ */
+export type StoreWriteTrouble = { kind: "store-write-failed"; error: string };
+
+/**
+ * Wraps every `saveAgentSet` call in this module. `effectDescription` is a
+ * short, already-true clause ("the session was stopped") describing what
+ * happened before this write was attempted — on failure it is folded into
+ * the error message so the caller is told exactly what the durable store
+ * may now be lying about, rather than merely that a write failed.
+ */
+async function saveOrReportFailure(
+  agentSetPath: string,
+  agentSet: AgentSet,
+  effectDescription: string
+): Promise<{ ok: true } | { ok: false; error: StoreWriteTrouble }> {
+  try {
+    await saveAgentSet(agentSetPath, agentSet);
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        kind: "store-write-failed",
+        error: `${effectDescription}, but the durable store write failed — the store may now be STALE relative to reality: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    };
+  }
+}
 
 async function loadOrRefuse(agentSetPath: string): Promise<{ ok: true; agentSet: AgentSet } | { ok: false; error: StoreTrouble }> {
   const loaded = await loadAgentSet(agentSetPath);
@@ -107,7 +154,8 @@ export type CreateAgentError =
   | { kind: "reserved-name"; word: string; message: string }
   | { kind: "name-taken"; holder: AgentRecord; message: string }
   | { kind: "directory-create-failed"; error: string }
-  | { kind: "spawn-failed"; error: string };
+  | { kind: "spawn-failed"; error: string }
+  | StoreWriteTrouble;
 
 export type CreateAgentResult = { ok: true; agent: AgentRecord } | { ok: false; error: CreateAgentError };
 
@@ -167,7 +215,25 @@ export async function createAgent(deps: AgentActionsDeps, params: CreateAgentPar
     }
   }
 
-  await saveAgentSet(deps.agentSetPath, inserted.agentSet);
+  const effectDescription =
+    initialState === "on" ? "the agent's directory was created and a session was started" : "the agent's directory was created";
+  const saved = await saveOrReportFailure(deps.agentSetPath, inserted.agentSet, effectDescription);
+  if (!saved.ok) {
+    // Unlike every other verb below, a write failure HERE leaves an id that
+    // exists nowhere in the store — a retry mints a fresh id and would never
+    // revisit this one, so the directory/session just created would
+    // otherwise leak forever. Roll back for real, best-effort, rather than
+    // relying on a later `delete` that has nothing to resolve by.
+    if (initialState === "on") {
+      try {
+        await stopAllSessionsUnderCwd(deps.runCommand, deps.agentDirectoryPath(id));
+      } catch {
+        // best-effort: the write-failure error below is what actually gets surfaced.
+      }
+    }
+    await removeAgentDirectory(deps.agentsBaseDir, id);
+    return saved;
+  }
   return { ok: true, agent: record };
 }
 
@@ -175,7 +241,12 @@ export async function createAgent(deps: AgentActionsDeps, params: CreateAgentPar
 // on (S4's `on` column)
 // ---------------------------------------------------------------------------
 
-export type OnAgentError = StoreTrouble | ResolveAgentError | { kind: "already-archived"; message: string } | { kind: "spawn-failed"; error: string };
+export type OnAgentError =
+  | StoreTrouble
+  | ResolveAgentError
+  | { kind: "already-archived"; message: string }
+  | { kind: "spawn-failed"; error: string }
+  | StoreWriteTrouble;
 export type OnAgentSuccess = { kind: "no-change" } | { kind: "turned-on" };
 export type OnAgentResult = { ok: true; outcome: OnAgentSuccess } | { ok: false; error: OnAgentError };
 
@@ -192,7 +263,12 @@ export async function turnOn(deps: AgentActionsDeps, query: string): Promise<OnA
   if (!spawnResult.ok) return { ok: false, error: { kind: "spawn-failed", error: spawnResult.error } };
 
   const updated: AgentRecord = { ...agent, state: "on" };
-  await saveAgentSet(deps.agentSetPath, { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } });
+  const saved = await saveOrReportFailure(
+    deps.agentSetPath,
+    { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } },
+    "a new session was started"
+  );
+  if (!saved.ok) return saved;
   return { ok: true, outcome: { kind: "turned-on" } };
 }
 
@@ -200,7 +276,13 @@ export async function turnOn(deps: AgentActionsDeps, query: string): Promise<OnA
 // off (S4's `off` column)
 // ---------------------------------------------------------------------------
 
-export type OffAgentError = StoreTrouble | ResolveAgentError | { kind: "archived" } & { message: string } | SessionLookupTrouble | SessionCleanupTrouble;
+export type OffAgentError =
+  | StoreTrouble
+  | ResolveAgentError
+  | ({ kind: "archived" } & { message: string })
+  | SessionLookupTrouble
+  | SessionCleanupTrouble
+  | StoreWriteTrouble;
 export type OffAgentSuccess = { kind: "no-change" } | { kind: "turned-off" };
 export type OffAgentResult = { ok: true; outcome: OffAgentSuccess } | { ok: false; error: OffAgentError };
 
@@ -219,7 +301,12 @@ export async function turnOff(deps: AgentActionsDeps, query: string): Promise<Of
   if (!stopped.ok) return stopped;
 
   const updated: AgentRecord = { ...agent, state: "off" };
-  await saveAgentSet(deps.agentSetPath, { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } });
+  const saved = await saveOrReportFailure(
+    deps.agentSetPath,
+    { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } },
+    "the session was stopped"
+  );
+  if (!saved.ok) return saved;
   return { ok: true, outcome: { kind: "turned-off" } };
 }
 
@@ -227,7 +314,13 @@ export async function turnOff(deps: AgentActionsDeps, query: string): Promise<Of
 // archive (S4's `archive` column)
 // ---------------------------------------------------------------------------
 
-export type ArchiveAgentError = StoreTrouble | ResolveAgentError | { kind: "already-archived"; message: string } | SessionLookupTrouble | SessionCleanupTrouble;
+export type ArchiveAgentError =
+  | StoreTrouble
+  | ResolveAgentError
+  | { kind: "already-archived"; message: string }
+  | SessionLookupTrouble
+  | SessionCleanupTrouble
+  | StoreWriteTrouble;
 export type ArchiveAgentSuccess = { kind: "archived" };
 export type ArchiveAgentResult = { ok: true; outcome: ArchiveAgentSuccess } | { ok: false; error: ArchiveAgentError };
 
@@ -245,7 +338,13 @@ export async function archiveAgent(deps: AgentActionsDeps, query: string): Promi
   }
 
   const updated: AgentRecord = { ...agent, state: "archived" };
-  await saveAgentSet(deps.agentSetPath, { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } });
+  const effectDescription = decision.effect === "stop-session" ? "the session was stopped" : "no session needed stopping";
+  const saved = await saveOrReportFailure(
+    deps.agentSetPath,
+    { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } },
+    effectDescription
+  );
+  if (!saved.ok) return saved;
   return { ok: true, outcome: { kind: "archived" } };
 }
 
@@ -253,7 +352,7 @@ export async function archiveAgent(deps: AgentActionsDeps, query: string): Promi
 // unarchive (S4's `unarchive` column — lands on `off`, NEVER `on`)
 // ---------------------------------------------------------------------------
 
-export type UnarchiveAgentError = StoreTrouble | ResolveAgentError | { kind: "not-archived"; message: string };
+export type UnarchiveAgentError = StoreTrouble | ResolveAgentError | { kind: "not-archived"; message: string } | StoreWriteTrouble;
 export type UnarchiveAgentSuccess = { kind: "unarchived" };
 export type UnarchiveAgentResult = { ok: true; outcome: UnarchiveAgentSuccess } | { ok: false; error: UnarchiveAgentError };
 
@@ -266,7 +365,12 @@ export async function unarchiveAgent(deps: AgentActionsDeps, query: string): Pro
   if (decision.kind === "refused") return { ok: false, error: { kind: "not-archived", message: decision.message } };
 
   const updated: AgentRecord = { ...agent, state: "off" };
-  await saveAgentSet(deps.agentSetPath, { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } });
+  const saved = await saveOrReportFailure(
+    deps.agentSetPath,
+    { ...agentSet, agents: { ...agentSet.agents, [agent.id]: updated } },
+    "no session change was made (unarchive never starts a session)"
+  );
+  if (!saved.ok) return saved;
   return { ok: true, outcome: { kind: "unarchived" } };
 }
 
@@ -279,7 +383,8 @@ export type RenameAgentError =
   | ResolveAgentError
   | { kind: "invalid-name"; message: string }
   | { kind: "reserved-name"; word: string; message: string }
-  | { kind: "name-taken"; holder: AgentRecord; message: string };
+  | { kind: "name-taken"; holder: AgentRecord; message: string }
+  | StoreWriteTrouble;
 
 export type RenameAgentResult = { ok: true; agent: AgentRecord } | { ok: false; error: RenameAgentError };
 
@@ -316,7 +421,8 @@ export async function renameAgent(deps: Pick<AgentActionsDeps, "agentSetPath">, 
     return { ok: false, error: { kind: "store-malformed", error: "renameAgent refused 'not-found' for an agent just resolved from the same set" } };
   }
 
-  await saveAgentSet(deps.agentSetPath, renamed.agentSet);
+  const saved = await saveOrReportFailure(deps.agentSetPath, renamed.agentSet, "the name was accepted");
+  if (!saved.ok) return saved;
   return { ok: true, agent: renamed.agentSet.agents[agent.id] as AgentRecord };
 }
 
@@ -329,7 +435,8 @@ export type DeleteAgentError =
   | ResolveAgentError
   | SessionLookupTrouble
   | SessionCleanupTrouble
-  | { kind: "directory-removal-failed"; reason: string };
+  | { kind: "directory-removal-failed"; reason: string }
+  | StoreWriteTrouble;
 
 export type DeleteAgentSuccess = { kind: "deleted" };
 export type DeleteAgentResult = { ok: true; outcome: DeleteAgentSuccess } | { ok: false; error: DeleteAgentError };
@@ -380,6 +487,11 @@ export async function deleteAgent(deps: AgentActionsDeps, query: string): Promis
     return { ok: false, error: { kind: "store-malformed", error: "deleteAgent refused 'not-found' for an agent just resolved from the same set" } };
   }
 
-  await saveAgentSet(deps.agentSetPath, deleted.agentSet);
+  const saved = await saveOrReportFailure(
+    deps.agentSetPath,
+    deleted.agentSet,
+    "the session was stopped and removed and the directory was deleted"
+  );
+  if (!saved.ok) return saved;
   return { ok: true, outcome: { kind: "deleted" } };
 }

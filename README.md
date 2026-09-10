@@ -856,7 +856,26 @@ calling these actions on drift, retiring the roster — is explicitly
   in `agent-lifecycle.ts`; apply the effect (session stop/start, directory
   create/remove); **persist the store write only after every effect has
   succeeded** — so a failed spawn or a failed stop never leaves the durable
-  store recording an intention this same call just learned is false.
+  store recording an intention this same call just learned is false. The
+  REVERSE direction — every effect succeeds, and the store write itself
+  then fails — is handled too, not left as an unhandled rejection: every
+  `saveAgentSet` call is wrapped and reported as a typed `store-write-failed`
+  error naming exactly which effect already happened, so the caller knows
+  reality and the store may now disagree. **Found live, in review, not by
+  reasoning**: an unwrapped `saveAgentSet` in `turnOff` meant a session that
+  really stopped, followed by a failed persist (probed with a `chmod`'d
+  state directory), threw instead of returning an error — leaving the store
+  still recording `"on"` for an agent CNDLX-19's reconcile loop would then
+  respawn, which is verbatim the bug the human's "recorded intention" model
+  exists to prevent. All seven `saveAgentSet` call sites are now wrapped and
+  tested for this failure (`test/unit/agent-actions.test.ts`'s "a failed
+  store WRITE is reported honestly" block, using the same real-`chmod`
+  technique, not a mock) — `create`'s case is the one exception that rolls
+  back for real (stops the just-started session, removes the
+  just-created directory) rather than only reporting, because a write
+  failure there leaves an id nowhere in the store: no later retry could
+  ever revisit it to clean it up, unlike every other verb, where the record
+  still exists and a retry (or a later `delete`) can.
   - `create`: mints an id, then directory, then record, then — if
     `initialState` (defaulted to `"on"`, S5) says so — the start effect.
     A failed start rolls back: the just-created directory is removed and
