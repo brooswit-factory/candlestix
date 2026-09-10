@@ -32,3 +32,4 @@ export const rosterPath = (): string => xdg.rosterPath(currentXdgInputs());
 export const registryPath = (): string => xdg.registryPath(currentXdgInputs());
 export const healthSignalPath = (): string => xdg.healthSignalPath(currentXdgInputs());
 export const agentMcpConfigPath = (agentName: string): string => xdg.agentMcpConfigPath(currentXdgInputs(), agentName);
+export const agentSetPath = (): string => xdg.agentSetPath(currentXdgInputs());

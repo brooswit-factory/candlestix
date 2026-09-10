@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveConfigHome, resolveRuntimeDir, resolveStateHome, rosterPath, registryPath, healthSignalPath, agentMcpConfigPath, type XdgInputs } from "../../src/xdg";
+import { resolveConfigHome, resolveRuntimeDir, resolveStateHome, rosterPath, registryPath, healthSignalPath, agentMcpConfigPath, candlestixStateDir, agentSetPath, type XdgInputs } from "../../src/xdg";
 
 const base: XdgInputs = {
   home: "/home/operator",
@@ -60,5 +60,16 @@ describe("derived paths", () => {
   test("agentMcpConfigPath is scoped per agent name, under the runtime dir", () => {
     const inputs = { ...base, runtimeDir: "/run/user/1000" };
     expect(agentMcpConfigPath(inputs, "release-notes")).toBe("/run/user/1000/candlestix/agents/release-notes/mcp.json");
+  });
+
+  test("agentSetPath lives under the STATE home (R5), not the runtime dir and not config", () => {
+    const inputs = { ...base, stateHome: "/home/operator/.local/state" };
+    expect(candlestixStateDir(inputs)).toBe("/home/operator/.local/state/candlestix");
+    expect(agentSetPath(inputs)).toBe("/home/operator/.local/state/candlestix/agents.json");
+  });
+
+  test("agentSetPath does not move when only the runtime dir changes — it is not under candlestixRuntimeDir", () => {
+    const withRuntime = { ...base, runtimeDir: "/run/user/1000" };
+    expect(agentSetPath(withRuntime)).toBe(agentSetPath(base));
   });
 });

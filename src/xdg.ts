@@ -68,3 +68,28 @@ export function healthSignalPath(inputs: XdgInputs): string {
 export function agentMcpConfigPath(inputs: XdgInputs, agentName: string): string {
   return join(candlestixRuntimeDir(inputs), "agents", agentName, "mcp.json");
 }
+
+/**
+ * `$XDG_STATE_HOME/candlestix` — home for the durable agent set (CNDLX-22),
+ * deliberately separate from `candlestixRuntimeDir` above. The agent set
+ * is the thing only candlestix knows and must survive a reboot; the
+ * runtime dir's contents (registry, health signal, MCP config) either are
+ * reconstructable from `claude`'s own state or are meant to die with the
+ * session. Merging them would drag the durable half down to the ephemeral
+ * half's lifetime — see this ticket's R5.
+ *
+ * State home over data home: the XDG spec frames state home as "current
+ * state of the application that can be reused on a restart" — which is
+ * exactly what the agent set is (which agents exist, named what, toggled
+ * how), not user-authored content the operator would think to back up or
+ * migrate independently of candlestix itself. `resolveStateHome` already
+ * existed in this module, exported and unit-tested, with no production
+ * path consuming it before this ticket — this is that path.
+ */
+export function candlestixStateDir(inputs: XdgInputs): string {
+  return join(resolveStateHome(inputs), "candlestix");
+}
+
+export function agentSetPath(inputs: XdgInputs): string {
+  return join(candlestixStateDir(inputs), "agents.json");
+}
