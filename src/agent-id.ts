@@ -79,9 +79,16 @@ export interface MintAgentIdInputs {
 }
 
 function base32DigitFrom(random01: number): number {
-  // Defensive clamp for a pathological source (out of [0,1), NaN, a stray
-  // negative): still always returns a value in [0, 32). A conforming
-  // source (including plain `Math.random`) never exercises this path.
+  // Defensive clamp for a pathological source (out of [0,1), a stray
+  // negative, or non-finite): always returns a value in [0, 32). A
+  // conforming source (including plain `Math.random`) never exercises this
+  // path. NaN/Infinity are checked explicitly because they are not fixed
+  // by the modulo clamp below: NaN propagates through every arithmetic op
+  // untouched, so `ID_ALPHABET[NaN]` would append the literal string
+  // "undefined" rather than a real character.
+  if (!Number.isFinite(random01)) {
+    return 0;
+  }
   const scaled = Math.floor(random01 * 32);
   return ((scaled % 32) + 32) % 32;
 }

@@ -56,6 +56,12 @@ describe("mintAgentId", () => {
     const id = mintAgentId(fixedInputs(1_726_000_000_000, [32, -1, 999, 1.5, -0.3, 0.9999999]));
     expect(isAgentId(id)).toBe(true);
   });
+
+  test("clamps a non-finite randomness source (NaN, +Infinity, -Infinity) rather than corrupting the id with a literal 'undefined'", () => {
+    const id = mintAgentId(fixedInputs(1_726_000_000_000, [NaN, Infinity, -Infinity]));
+    expect(isAgentId(id)).toBe(true);
+    expect(id).not.toContain("undefined");
+  });
 });
 
 describe("isAgentId", () => {
