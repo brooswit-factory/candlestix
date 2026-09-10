@@ -5,7 +5,7 @@ import { mintAgentId } from "../../src/agent-id";
 import type { AgentRecord } from "../../src/agent";
 
 function id(seed: number): string {
-  return mintAgentId({ now: () => new Date(1_726_000_000_000 + seed), randomBase32Digit: () => seed % 32 });
+  return mintAgentId({ now: () => new Date(1_726_000_000_000 + seed), random: () => (seed % 32) / 32 });
 }
 
 function record(overrides: Partial<AgentRecord> & { id: string }): AgentRecord {

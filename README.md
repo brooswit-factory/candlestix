@@ -626,9 +626,21 @@ functions this section documents rather than re-decide any of it.
   represented by absence from the store, not as a fourth state value — see
   `agent-set.ts` below.
 
-- **`agent-id.ts`** — `mintAgentId({ now, randomBase32Digit })`, pure, with
-  clock and randomness as injected parameters (this tree's existing
-  convention — see `staleness.ts`, `xdg.ts`). A minted id is `@` followed by
+- **`agent-id.ts`** — `mintAgentId({ now, random })`, pure, with clock and
+  randomness as injected parameters (this tree's existing convention — see
+  `staleness.ts`, `xdg.ts`). `random` is a `[0,1)` float — exactly
+  `Math.random`'s own contract, deliberately not "an integer digit in
+  [0, 32)" as an earlier version of this function asked for: that contract
+  silently broke on the single most obvious thing to pass it. Caught in
+  review, with a probe: `Math.floor` of any `[0,1)` value is always `0`, so
+  passing `Math.random` straight through collapsed the entire random part to
+  zeros and produced byte-identical ids for two agents minted in the same
+  millisecond — `isAgentId` still accepted the result, and no test caught it
+  because every test already injected a conforming source. Fixed by changing
+  the contract itself rather than adding a runtime check, so `Math.random` is
+  correct by construction; a regression test
+  (`test/unit/agent-id.test.ts`) mints twice through `Math.random` in the
+  same millisecond and asserts the ids differ. A minted id is `@` followed by
   18 Crockford-base32 characters (10 encoding the mint timestamp, 8 random —
   a ULID-shaped id, sized down since only per-process uniqueness was needed,
   not global cross-machine sortability). **Why `@`, concretely:** R1 (id and

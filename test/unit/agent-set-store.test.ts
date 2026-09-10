@@ -8,7 +8,7 @@ import { mintAgentId } from "../../src/agent-id";
 import type { AgentRecord } from "../../src/agent";
 
 const entry: AgentRecord = {
-  id: mintAgentId({ now: () => new Date(1_726_000_000_000), randomBase32Digit: () => 7 }),
+  id: mintAgentId({ now: () => new Date(1_726_000_000_000), random: () => 7 / 32 }),
   name: "release-notes",
   state: "on",
   createdAt: "2026-09-02T00:00:00.000Z",

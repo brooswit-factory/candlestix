@@ -63,8 +63,27 @@ function encodeBase32Fixed(value: number, length: number): string {
 export interface MintAgentIdInputs {
   /** Injected clock — see this tree's clock-as-parameter convention. */
   now: () => Date;
-  /** Injected randomness source: must return an integer in [0, 32). */
-  randomBase32Digit: () => number;
+  /**
+   * Injected randomness source: a float in [0, 1), the exact contract
+   * `Math.random` already satisfies. Deliberately NOT "an integer digit in
+   * [0, 32)" (an earlier version of this function asked for that): that
+   * contract is easy to satisfy incorrectly and impossible to check at the
+   * type level — passing `Math.random` straight through (a [0,1) float)
+   * silently produced digit 0 every time (`Math.floor` of anything below 1
+   * is 0), so every id minted within the same millisecond collapsed to the
+   * same "random" suffix. A [0,1) contract makes `Math.random` — the thing
+   * anyone reaches for first — correct by construction instead of relying
+   * on every caller to remember to scale it themselves.
+   */
+  random: () => number;
+}
+
+function base32DigitFrom(random01: number): number {
+  // Defensive clamp for a pathological source (out of [0,1), NaN, a stray
+  // negative): still always returns a value in [0, 32). A conforming
+  // source (including plain `Math.random`) never exercises this path.
+  const scaled = Math.floor(random01 * 32);
+  return ((scaled % 32) + 32) % 32;
 }
 
 /** Mints a fresh, durable agent id. Pure given its inputs — deterministic under test with a fixed clock/randomness. */
@@ -73,8 +92,7 @@ export function mintAgentId(inputs: MintAgentIdInputs): string {
   const timestampPart = encodeBase32Fixed(Math.max(0, timestampMs), TIMESTAMP_CHARS);
   let randomPart = "";
   for (let i = 0; i < RANDOM_CHARS; i++) {
-    const digit = Math.floor(inputs.randomBase32Digit()) % 32;
-    randomPart += ID_ALPHABET[((digit % 32) + 32) % 32];
+    randomPart += ID_ALPHABET[base32DigitFrom(inputs.random())];
   }
   return `${ID_PREFIX}${timestampPart}${randomPart}`;
 }

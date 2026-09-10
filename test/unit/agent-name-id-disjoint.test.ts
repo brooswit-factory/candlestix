@@ -54,7 +54,7 @@ describe("R1: id-space and name-space are disjoint", () => {
     for (let i = 0; i < 1000; i++) {
       const id = mintAgentId({
         now: () => new Date(clockBase + i),
-        randomBase32Digit: () => Math.floor(rand() * 32),
+        random: rand, // rand() already returns a [0,1) float — mintAgentId's exact contract, same shape as Math.random
       });
       const result = validateAgentNameSyntax(id);
       if (!result.ok) rejectedCount += 1;
