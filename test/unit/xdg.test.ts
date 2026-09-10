@@ -1,5 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { resolveConfigHome, resolveRuntimeDir, resolveStateHome, rosterPath, registryPath, healthSignalPath, agentMcpConfigPath, candlestixStateDir, agentSetPath, type XdgInputs } from "../../src/xdg";
+import {
+  resolveConfigHome,
+  resolveRuntimeDir,
+  resolveStateHome,
+  rosterPath,
+  registryPath,
+  healthSignalPath,
+  legacyRosterMcpConfigPath,
+  agentMcpConfigPath,
+  candlestixStateDir,
+  agentSetPath,
+  agentsBaseDir,
+  agentDirectoryPath,
+  type XdgInputs,
+} from "../../src/xdg";
+import { mintAgentId } from "../../src/agent-id";
 
 const base: XdgInputs = {
   home: "/home/operator",
@@ -57,9 +72,50 @@ describe("derived paths", () => {
     expect(healthSignalPath(inputs)).toBe("/run/user/1000/candlestix/health.json");
   });
 
-  test("agentMcpConfigPath is scoped per agent name, under the runtime dir", () => {
+  test("legacyRosterMcpConfigPath is scoped per agent NAME, under the runtime dir — condemned, roster-only (R16)", () => {
     const inputs = { ...base, runtimeDir: "/run/user/1000" };
-    expect(agentMcpConfigPath(inputs, "release-notes")).toBe("/run/user/1000/candlestix/agents/release-notes/mcp.json");
+    expect(legacyRosterMcpConfigPath(inputs, "release-notes")).toBe("/run/user/1000/candlestix/agents/release-notes/mcp.json");
+  });
+
+  test("agentMcpConfigPath (R16) is scoped per agent ID, under the runtime dir — the live, honest path", () => {
+    const inputs = { ...base, runtimeDir: "/run/user/1000" };
+    const id = mintAgentId({ now: () => new Date(0), random: () => 0.5 });
+    expect(agentMcpConfigPath(inputs, id)).toBe(`/run/user/1000/candlestix/agents/${id}/mcp.json`);
+  });
+
+  test("agentMcpConfigPath refuses a name — it is id-validated, not merely id-shaped by convention", () => {
+    const inputs = { ...base, runtimeDir: "/run/user/1000" };
+    expect(() => agentMcpConfigPath(inputs, "release-notes")).toThrow();
+  });
+
+  test("agentMcpConfigPath's path is a real function of its id argument — different ids give different paths", () => {
+    // Guards against the function silently ignoring its argument (e.g.
+    // returning a fixed path) — a test asserting `f(x) === f(x)` for a
+    // fixed `x` would pass even if it did. This function never takes a
+    // name at all, so "does it move on rename" isn't a question this pure
+    // layer can pose; the real, non-tautological proof that RENAMING AN
+    // AGENT does not move its MCP config path — an actual rename, with the
+    // path re-derived and asserted equal before/after — lives in
+    // `test/unit/agent-actions.test.ts`'s rename tests.
+    const inputs = { ...base, runtimeDir: "/run/user/1000" };
+    const idA = mintAgentId({ now: () => new Date(0), random: () => 0.5 });
+    const idB = mintAgentId({ now: () => new Date(1), random: () => 0.25 });
+    expect(idA).not.toBe(idB);
+    expect(agentMcpConfigPath(inputs, idA)).not.toBe(agentMcpConfigPath(inputs, idB));
+  });
+
+  test("agentsBaseDir and agentDirectoryPath (S1) live under the STATE home, one level below agents.json, keyed by id", () => {
+    const inputs = { ...base, stateHome: "/home/operator/.local/state" };
+    expect(agentsBaseDir(inputs)).toBe("/home/operator/.local/state/candlestix/agents");
+    const id = mintAgentId({ now: () => new Date(0), random: () => 0.5 });
+    expect(agentDirectoryPath(inputs, id)).toBe(`/home/operator/.local/state/candlestix/agents/${id}`);
+  });
+
+  test("agents.json and agents/ cannot collide — different filesystem entries at the same parent", () => {
+    const inputs = { ...base, stateHome: "/home/operator/.local/state" };
+    expect(agentsBaseDir(inputs)).not.toBe(agentSetPath(inputs));
+    expect(agentSetPath(inputs).startsWith(candlestixStateDir(inputs))).toBe(true);
+    expect(agentsBaseDir(inputs).startsWith(candlestixStateDir(inputs))).toBe(true);
   });
 
   test("agentSetPath lives under the STATE home (R5), not the runtime dir and not config", () => {

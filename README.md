@@ -582,8 +582,26 @@ above targets `candlestix.service` specifically.)
 | Roster (operator-edited, read-only to candlestix) | `$XDG_CONFIG_HOME/candlestix/roster.yaml`, falling back to `~/.config/candlestix/roster.yaml` | reboot |
 | Registry | `$XDG_RUNTIME_DIR/candlestix/registry.json` | daemon restart, not reboot |
 | Health signal | `$XDG_RUNTIME_DIR/candlestix/health.json` | daemon restart, not reboot |
-| Per-agent MCP config | `$XDG_RUNTIME_DIR/candlestix/agents/<name>/mcp.json` | daemon restart, not reboot |
+| Per-agent MCP config, roster-driven agent (CONDEMNED — `legacyRosterMcpConfigPath`, R16) | `$XDG_RUNTIME_DIR/candlestix/agents/<name>/mcp.json` | daemon restart, not reboot |
+| Per-agent MCP config, daemon-created agent (`agentMcpConfigPath`, R16) | `$XDG_RUNTIME_DIR/candlestix/agents/<id>/mcp.json` | daemon restart, not reboot |
 | Durable agent set | `$XDG_STATE_HOME/candlestix/agents.json`, falling back to `~/.local/state/candlestix/agents.json` | **reboot** |
+| **Per-agent directory** (CNDLX-23, S1) | `$XDG_STATE_HOME/candlestix/agents/<id>/`, same fallback base | **reboot** |
+
+CNDLX-23 (this story's own work — see "The lifecycle action set" below)
+re-keyed the per-agent MCP config for a **daemon-created** agent from the
+agent's mutable **name** to its immutable **id** — verified still
+name-keyed, with exactly one production call site (the roster's own spawn
+path), at this story's own commit before the fix. That one remaining
+name-keyed call site is kept, deliberately, as its own loudly-named
+function (`legacyRosterMcpConfigPath`) rather than folded into the id-keyed
+one: the roster's agents have no id at all, so the id-keyed function could
+never serve that call site anyway, and CNDLX-19 retires the whole roster
+path, this function included. **No per-agent path for a daemon-created
+agent is keyed by a mutable name any more** — proven the same way "rename
+never moves the directory" is proven: rename an agent, assert its
+directory path and its MCP config path are both unchanged (see
+`test/unit/agent-actions.test.ts`'s rename tests). One further name-keyed
+structure was found and NOT fixed, deliberately — see "Known gaps" below.
 
 `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` set to the **empty
 string** are treated identically to unset (`src/xdg.ts`, unit-tested) — a
@@ -737,6 +755,196 @@ itself. `resolveStateHome` already existed in `src/xdg.ts`, exported and
 unit-tested, with no production path consuming it before this story; this
 is that path.
 
+## The lifecycle action set (`src/agent-lifecycle.ts`, `src/agent-directory.ts`, `src/agent-session.ts`, `src/agent-spawn.ts`, `src/agent-actions.ts`)
+
+CNDLX-23, on top of everything in "The durable agent set" above: the eight
+verbs — `create`, `on`, `off`, `rename`, `archive`, `unarchive`, `delete`,
+`list` — as plain callable functions over CNDLX-17/22's record, store and
+resolver. **No CLI, no HTTP, no API, no UI** (CNDLX-15's scope) and
+**`attach` is not built** (CNDLX-3's scope, left a seam). Wiring the
+supervisor/reconcile loop to obey these states — reading the agent set,
+calling these actions on drift, retiring the roster — is explicitly
+**CNDLX-19's**, not this story's: nothing here is called from
+`src/index.ts` or `src/supervisor.ts`.
+
+- **`agent-lifecycle.ts`** — the PURE transition rules (R9), split from the
+  effects that apply them. `decideOn`/`decideOff`/`decideArchive`/
+  `decideUnarchive`/`decideDelete` each take only the current
+  `AgentLifecycleState` and return a typed decision: a refusal (R8, with a
+  message that names why — e.g. turning an archived agent on names
+  `unarchive` in its refusal), an idempotent `no-change` (the diagonal:
+  `on` of an already-on agent, `off` of an already-off one — reported as an
+  explicit success, never a silent no-op and never a refusal), or a
+  transition naming the effect it requires (`start-session`,
+  `stop-session`, or `none`). `unarchive` always lands on `off`, never
+  `on`. `delete` is legal unconditionally from any state. Also here:
+  `checkAgentNameAllowed` (R17), layering the reserved-word refusal on top
+  of CNDLX-17's standalone `validateAgentNameSyntax` exactly the way that
+  module's own doc comment invites, rather than forking the syntax rule.
+  **R17's own open question — "the five CLI verbs, or the whole action-set
+  vocabulary" — is settled here as the whole vocabulary**: `create`,
+  `attach`, `on`, `off`, `rename`, `name`, `archive`, `unarchive`, `delete`,
+  `list`. Reasoning carried over from the epic: reserving a word later
+  breaks any agent already holding it; un-reserving one later breaks
+  nothing — so the cheap, reversible direction is the superset now, even
+  though `attach`/`unarchive`/`list` have no CLI verb yet. Exhaustively
+  unit-tested over all three states for every verb, including every refusal
+  (`test/unit/agent-lifecycle.test.ts`).
+
+- **`agent-directory.ts`** — S1's per-agent directory
+  (`$XDG_STATE_HOME/candlestix/agents/<id>/`, one level below `agents.json`
+  — see the XDG table above) and S3's guarded recursive removal.
+  `guardAgentDirectoryRemoval` is **pure** (no fs access) and is what makes
+  the guard "a test, not a comment": it refuses unless the argument is
+  structurally a minted id (`isAgentId`) and refuses unless the path it
+  derives is a direct child of the agents base directory — fed hostile
+  inputs (`""`, `".."`, `"../../etc/passwd"`, an absolute path, the base
+  dir itself, an id-shaped string with a smuggled `/` or `..`) and asserted
+  to refuse **and leave real files on disk untouched**, not merely to
+  return an error (`test/unit/agent-directory.test.ts`). The second check
+  (direct-child) is structurally unreachable through anything that already
+  passes the first, given `isAgentId`'s alphabet — kept anyway, as
+  deliberate belt-and-suspenders rather than evidence it is dead, the same
+  reasoning `agent-resolver.ts`'s `ambiguous` case already used. Removal
+  uses `force: true` so "already gone" is a success, not an error — that is
+  idempotence, not error-swallowing; a real removal failure (permissions, a
+  race) still surfaces as `{ ok: false, reason }`.
+
+- **`agent-session.ts`** — S2 + R7: finds an agent's live `claude --bg`
+  session(s) by its **directory**, via `claude agents --json --cwd <dir>`,
+  never through a registry keyed by name. `--cwd` is documented as a
+  *prefix* match ("under `<path>`"); this module re-filters to an **exact**
+  match itself rather than trusting the flag alone — verified live at this
+  story's own `claude` version (see "R7's live demonstration" below).
+  `stopSession`/`removeSession` call exactly `claude stop <id>` / `claude
+  rm <id>` — the per-session verbs `claude` itself provides — and nothing
+  here ever shells out to `systemctl` or signals a cgroup. **S2's
+  ambiguity ruling, made explicit rather than silently taking the first
+  match**: if more than one live session's cwd matches an agent's directory
+  exactly, `stopAllSessionsUnderCwd`/`stopAndRemoveAllSessionsUnderCwd` act
+  on **every** match, because the state being reached ("no live session
+  under this directory") is the same regardless of which one, if any, was
+  "the real one" — leaving a second one running would silently contradict
+  the store's own "off" recording. A session that fails to stop is never
+  then handed to `rm` (S3: never remove a conversation that might still be
+  live).
+
+- **`agent-spawn.ts`** — `spawnDaemonAgent`, the spawn entry point for a
+  daemon-created `AgentRecord`, sibling to (not a replacement for)
+  `spawn.ts`'s roster-driven `spawnBackgroundAgent`. **R11, the live fix
+  this story owns**: `job` is optional on an `AgentRecord`; where absent,
+  `--append-system-prompt` is **omitted from argv entirely**, never passed
+  an empty string — verified at this story's own commit that the
+  roster-driven path still passes it unconditionally (correct there: a
+  roster entry's `job` is required, and that path is retired with the
+  roster by CNDLX-19, not fixed here). **S6**: writes `{"mcpServers":{}}`
+  at the id-keyed MCP path and keeps `--strict-mcp-config` — an agent gets
+  exactly the MCP servers candlestix configured (none, today) and nothing
+  ambient. How an operator adds an MCP server to an agent is **unowned by
+  any current story** — this is intentional (the product's own model is
+  that MCP setup happens in conversation) and is flagged here so it stays
+  visible rather than buried. Every launch is still wrapped in its own
+  `systemd-run --user --scope --expand-environment=no`, for exactly the R7
+  reasons already documented under "Spawning agents" above.
+
+- **`agent-actions.ts`** — the eight verbs themselves, wiring the above
+  together with CNDLX-17/22's store, resolver and mutators. The shared
+  shape, applied uniformly: load the store (a `malformed` result refuses
+  **every** action outright — never treated as empty, tested for all eight
+  verbs in `test/unit/agent-actions.test.ts`); resolve `<id-or-name>`
+  through `resolveAgent` when the verb takes one; consult the pure decision
+  in `agent-lifecycle.ts`; apply the effect (session stop/start, directory
+  create/remove); **persist the store write only after every effect has
+  succeeded** — so a failed spawn or a failed stop never leaves the durable
+  store recording an intention this same call just learned is false. The
+  REVERSE direction — every effect succeeds, and the store write itself
+  then fails — is handled too, not left as an unhandled rejection: every
+  `saveAgentSet` call is wrapped and reported as a typed `store-write-failed`
+  error naming exactly which effect already happened, so the caller knows
+  reality and the store may now disagree. **Found live, in review, not by
+  reasoning**: an unwrapped `saveAgentSet` in `turnOff` meant a session that
+  really stopped, followed by a failed persist (probed with a `chmod`'d
+  state directory), threw instead of returning an error — leaving the store
+  still recording `"on"` for an agent CNDLX-19's reconcile loop would then
+  respawn, which is verbatim the bug the human's "recorded intention" model
+  exists to prevent. All seven `saveAgentSet` call sites are now wrapped and
+  tested for this failure (`test/unit/agent-actions.test.ts`'s "a failed
+  store WRITE is reported honestly" block, using the same real-`chmod`
+  technique, not a mock) — `create`'s case is the one exception that rolls
+  back for real (stops the just-started session, removes the
+  just-created directory) rather than only reporting, because a write
+  failure there leaves an id nowhere in the store: no later retry could
+  ever revisit it to clean it up, unlike every other verb, where the record
+  still exists and a retry (or a later `delete`) can.
+  - `create`: mints an id, then directory, then record, then — if
+    `initialState` (defaulted to `"on"`, S5) says so — the start effect.
+    A failed start rolls back: the just-created directory is removed and
+    **nothing is ever written to the store** (verified: after a simulated
+    spawn failure, `loadAgentSet` still reports `missing`, and the agents
+    directory is empty). Accepts no name and no job at all — the blank
+    agent, this product's headline case.
+  - `rename`: touches only the store's `name` field. Never touches
+    `agentDirectoryPath` or `agentMcpConfigPath` — both are keyed by `id`,
+    not `name` — so "a rename never moves the directory" (and, post-R16,
+    never moves the MCP config either) holds **by construction**, not by
+    remembering not to touch them. Verified directly: rename an agent,
+    assert both paths are byte-identical before and after.
+  - `delete`: S3's exact order — stop the live session (if any, by exact
+    directory) → remove it and its conversation (`claude rm`) → remove the
+    directory (guarded, see `agent-directory.ts`) → `deleteAgent` in the
+    store (retires the id, frees the name). **Every step is idempotent**,
+    so a retry after a crash between any two steps completes correctly
+    with no double-effect: a second `stopAndRemoveAllSessionsUnderCwd` call
+    finds nothing and succeeds trivially once the session is already gone;
+    a second `removeAgentDirectory` call succeeds trivially
+    (`force: true`) once the directory is already gone. Verified live that
+    the directory is **actually** gone by an independent `stat()` call, not
+    by the absence of an error.
+  - `list`: a plain projection over the store — `state` is on every record
+    already, so CNDLX-15 (hide archived from the main list) and CNDLX-16
+    (an Archived tab) need no second query (R10).
+
+### R7's live demonstration
+
+Run against a **scratch** tree (a temp directory standing in for
+`XDG_STATE_HOME`/`XDG_RUNTIME_DIR`), never a real operator's agent set, and
+only ever touching two sessions this demonstration itself spawned
+(`demo-agent-a`, `demo-agent-b`) — the full "before" listing was captured
+first and diffed against after, per the safety rules this ticket sets.
+Every command and its real output is quoted in the PR description. What was
+shown, live, on this story's own host:
+
+- Two agents `on`; turning one **off** left the other's session and pid
+  **unaffected** (same pid before/after, independently re-verified via
+  `kill(pid, 0)`), left the shared `claude daemon run` singleton's pid
+  **unaffected**, left the turned-off agent's directory **in place**, and
+  recorded `state: "off"` durably.
+- `on` started a fresh session again; `archive` stopped and hid a session;
+  **`on` of an archived agent was refused** (not silently unarchived);
+  `unarchive` returned it to `off`, **never `on`**, and started no session.
+- `delete` on both agents left **no directory** for either — checked by an
+  independent `stat()` after cleanup, not by the absence of an error — and
+  the host's full `claude agents --json` listing (19 sessions, all
+  pre-existing interactive ones on this shared, busy host) was
+  byte-identical before and after.
+- **One genuine finding, stated at its real strength**: after the demo's
+  last `claude rm`, a transient `systemd-run --scope` unit
+  (`candlestix-launch-<id>-*`) was observed still `active (running)` for
+  up to roughly 15-30 seconds, containing not the agent's session itself
+  but a `claude bg-pty-host --bg-spare` helper process — an internal,
+  undocumented (from this codebase's own comments) pre-warming mechanism
+  `claude --bg` appears to use for faster future launches. It self-resolved
+  with **no operator action** within that window and required no
+  `systemctl` intervention (the demo never used one, per the hard safety
+  rule) — observed once, not measured as a bound the way
+  `docs/review-commit-immutability.md`'s 30-56s figure was. Recorded here
+  rather than silently waited out, because "the scope was gone eventually"
+  and "the scope was gone the instant `claude rm` returned" are different
+  claims, and CNDLX-19's own reconcile loop should not assume the latter.
+- This demonstration ran against `claude` 2.1.267 and `bun` 1.3.14 on this
+  story's own host; both are worth re-checking on a different host per this
+  ticket's own instructions.
+
 ## Known gaps — stated plainly, not implied away
 
 - **No candlestix-specific attach convenience.** `claude attach <id>` /
@@ -783,14 +991,76 @@ is that path.
 - **Boot-at-startup**: the enablement/linger mechanism is verified; an
   actual reboot was not performed on the shared host this was built on.
   See "systemd user unit" above.
-- **No lifecycle verbs, no reserved-word list, on the durable agent set.**
-  `create`/`on`/`off`/`rename`/`archive`/`unarchive`/`delete`/`list`, and a
-  reserved-word check guarding a bare name against colliding with a future
-  CLI's own verb grammar, are explicitly a sibling story's scope — see "The
-  durable agent set" above for exactly what this story provides for that
-  story to call. Nothing spawns, persists, or exposes an agent set today;
-  `agent-set-store.ts`'s `loadAgentSet`/`saveAgentSet` are not yet wired
-  into `src/index.ts` or the supervisor loop.
+- **The lifecycle action set exists but is wired into nothing.** CNDLX-23
+  delivered `create`/`on`/`off`/`rename`/`archive`/`unarchive`/`delete`/
+  `list` as plain functions (see "The lifecycle action set" above) —
+  nothing calls them from `src/index.ts` or the supervisor loop, the
+  durable agent set is not read by the reconcile cycle, and the roster is
+  not retired. All of that is **CNDLX-19's**, by this ticket's own explicit
+  instruction not to take it: do not rewrite `decideReconcileAction`, do
+  not make the loop read the agent set, do not retire the roster.
+- **`attach` is not built.** Left a seam, per CNDLX-3's ownership of it —
+  and per R18 (arrived after this story was filed), that seam is shaped as
+  **one query, not an act**: resolve `<id-or-name>`, decide whether it is
+  attachable right now, return the live session identity — never "open a
+  terminal and attach," which is the caller's concern (a CLI execs in
+  place; a daemon-owned webapp path spawns a window), not candlestix
+  core's. `agent-session.ts`'s `findAgentSessions` already **is** that
+  query — R18 names it explicitly as the same lookup S2 already specifies,
+  one implementation for both callers, not a second. What this story does
+  NOT add: the attach-specific refusals R18 describes (an `off` or
+  `archived` agent has no session to attach to and would be refused, never
+  silently started) — no caller exists yet to refuse on behalf of, and
+  adding them here with no caller would be scope this ticket does not
+  claim.
+- **No CLI, no HTTP daemon API, no webapp** call any of this yet — CNDLX-15
+  and CNDLX-16's scope. The action set (`agent-actions.ts`) is the seam
+  they are meant to build on.
+- **One more name-keyed structure was found and deliberately NOT fixed**:
+  `src/registry.ts`'s session registry (`Registry.agents`) is keyed by the
+  roster agent's **name**, the same bug class as the MCP-config path R16
+  fixed. Not fixed here, on purpose, for two reasons: it is *ephemeral and
+  reconstructable* from `claude`'s own live state on the very next
+  reconcile cycle (a rename orphaning an entry costs one self-healing
+  cycle, not durable data — unlike the MCP path, which R16 fixed because
+  losing it silently was a durability bug), and it is written by the
+  reconcile/supervisor modules CNDLX-19 is about to rewrite to be
+  desired-state driven. Fixing it here would collide with that rewrite in
+  the same files for no durability gain. Searched for a **third** instance
+  of the same bug class (any per-agent path or state keyed by a mutable
+  label rather than an id) and found none beyond these two;
+  `spawn.ts`'s `unitName` is built from a roster agent's name too, but a
+  systemd-run unit name is a one-shot launch identifier scoped to a single
+  spawn call, not durable per-agent state a rename could ever orphan, so it
+  does not fit this bug class.
+- **How an operator adds an MCP server to a daemon-created agent is
+  unowned by any current story.** S6 gives every daemon-created agent an
+  empty MCP config and keeps `--strict-mcp-config`; the product's own model
+  is that this happens in conversation, but no verb or surface configures
+  it yet. Flagged explicitly rather than left implicit.
+- **The `claude bg-pty-host --bg-spare` finding** (see "R7's live
+  demonstration" above): a transient helper process and its wrapping
+  systemd scope can outlive `claude rm` by roughly 15-30 seconds before
+  self-resolving. Observed once, not measured as a reliable bound. Neither
+  `agent-session.ts` nor `agent-directory.ts` waits for or checks this —
+  they only need `claude`'s own tracked session state, which is already
+  correct by the time `claude stop`/`rm` return; this is recorded as an
+  open question for whoever eventually needs "the host has zero leftover
+  candlestix processes" as a hard, checkable postcondition (CNDLX-19's
+  reconcile loop, most plausibly), not as a defect in this story's own
+  actions.
+- **The R7 live demonstration used a scratch state/runtime tree and this
+  story's own host**, which — per the ticket's own framing — slightly
+  narrows what it proves: it did not run inside candlestix.service's own
+  cgroup, and no real reboot was performed (same honest gap CNDLX-17
+  already recorded for the durable store).
+- **Bun version**: this story's own suite, typecheck, and build were run on
+  bun **1.3.14** (`bun --version`), the same version CNDLX-17 verified
+  against, not the target laptop's 1.3.11. No bun API newer than what
+  CNDLX-17 already used was added by this story's own modules — checked by
+  inspection (`node:fs/promises`, `node:path`, `node:crypto`, `Bun.spawn`,
+  all already in use elsewhere in this tree), not by running the suite on
+  1.3.11 itself.
 
 ## Tooling
 
