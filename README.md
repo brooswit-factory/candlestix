@@ -583,6 +583,7 @@ above targets `candlestix.service` specifically.)
 | Registry | `$XDG_RUNTIME_DIR/candlestix/registry.json` | daemon restart, not reboot |
 | Health signal | `$XDG_RUNTIME_DIR/candlestix/health.json` | daemon restart, not reboot |
 | Per-agent MCP config | `$XDG_RUNTIME_DIR/candlestix/agents/<name>/mcp.json` | daemon restart, not reboot |
+| Durable agent set | `$XDG_STATE_HOME/candlestix/agents.json`, falling back to `~/.local/state/candlestix/agents.json` | **reboot** |
 
 `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` set to the **empty
 string** are treated identically to unset (`src/xdg.ts`, unit-tested) — a
@@ -596,6 +597,145 @@ presented as equivalent. `XDG_RUNTIME_DIR` was set
 (`/run/user/<uid>`) and `XDG_STATE_HOME` was unset on the host this was
 verified against — both cases this table's fallback column depends on are
 real, not hypothetical, on the actual target host.
+
+## The durable agent set (`src/agent.ts`, `src/agent-id.ts`, `src/agent-set.ts`, `src/agent-set-store.ts`, `src/agent-resolver.ts`)
+
+The roster above is the operator-authored *config* for a fleet of identical,
+role-less blank agents. This is the bottom layer of a different model,
+landing underneath it: the daemon itself creating, naming, renaming, turning
+on/off, archiving, and deleting agents — state candlestix writes about
+itself, not state an operator hand-edits. **This story delivers only the
+record, id minting, the durable store (with its invariants), and the
+id/name resolver — no CLI, no HTTP, no lifecycle verb.** A sibling story
+builds `create`/`on`/`off`/`rename`/`archive`/`unarchive`/`delete`/`list` on
+top of what is described here; those verbs are expected to call the
+functions this section documents rather than re-decide any of it.
+
+- **`agent.ts`** — the `AgentRecord` type (`id`, optional `name`, optional
+  `job`, a flat `state: "on" | "off" | "archived"`, `createdAt`) and
+  `validateAgentNameSyntax`, a pure, standalone name-syntax check. It is
+  exported on its own — not folded into a bigger "validate a rename"
+  function — specifically so a later CLI epic can layer a reserved-word
+  check (`on`, `off`, `name`, `archive`, `delete` as verbs a bare name could
+  collide with in the CLI's own grammar) on top without forking these rules.
+  That reserved-word list is deliberately **not** implemented here — it
+  belongs to the `create`/`rename` actions, not to name syntax itself.
+  Character set is the existing roster name pattern's, reused verbatim
+  (`[a-z0-9][a-z0-9._-]*`), plus a length bound (1-63 chars, this story's own
+  call — an unbounded name is an easy accidental footgun). "Deleted" is
+  represented by absence from the store, not as a fourth state value — see
+  `agent-set.ts` below.
+
+- **`agent-id.ts`** — `mintAgentId({ now, random })`, pure, with clock and
+  randomness as injected parameters (this tree's existing convention — see
+  `staleness.ts`, `xdg.ts`). `random` is a `[0,1)` float — exactly
+  `Math.random`'s own contract, deliberately not "an integer digit in
+  [0, 32)" as an earlier version of this function asked for: that contract
+  silently broke on the single most obvious thing to pass it. Caught in
+  review, with a probe: `Math.floor` of any `[0,1)` value is always `0`, so
+  passing `Math.random` straight through collapsed the entire random part to
+  zeros and produced byte-identical ids for two agents minted in the same
+  millisecond — `isAgentId` still accepted the result, and no test caught it
+  because every test already injected a conforming source. Fixed by changing
+  the contract itself rather than adding a runtime check, so `Math.random` is
+  correct by construction; a regression test
+  (`test/unit/agent-id.test.ts`) mints twice through `Math.random` in the
+  same millisecond and asserts the ids differ. A minted id is `@` followed by
+  18 Crockford-base32 characters (10 encoding the mint timestamp, 8 random —
+  a ULID-shaped id, sized down since only per-process uniqueness was needed,
+  not global cross-machine sortability). **Why `@`, concretely:** R1 (id and
+  name spaces disjoint *by construction*) needs a property that survives
+  without relying on the name grammar's leading-character class — the
+  existing roster name pattern starts with a letter *or digit*, so a
+  leading-digit-means-id convention would have required tightening it.
+  `@` sidesteps that: it is a character `AGENT_NAME_PATTERN`'s charset
+  excludes at *every* position, not just the first, so no valid name can
+  ever collide with an id regardless of how the name grammar's own leading
+  character class is defined. `#` was considered and rejected — it starts a
+  shell comment as the first character of an unquoted word, exactly wrong
+  for "an operator can type this at a shell" (this ticket's own
+  requirement); `@` has no such shell hazard and reads naturally aloud.
+  `isAgentId(value)` is the structural (store-free) shape check the resolver
+  and the store both use. **Proof, not assertion**
+  (`test/unit/agent-name-id-disjoint.test.ts`): 1000 ids minted through the
+  real minter are each checked against the real name validator (all
+  rejected), and the converse — 1000 validator-accepted names, randomly
+  generated within the grammar plus hand-picked edge cases — are each
+  checked against `isAgentId` (none accepted).
+
+- **`agent-set.ts`** — the pure half of the store: `AgentSet` (`{ version:
+  1, agents: Record<id, AgentRecord>, retiredIds: string[] }`),
+  `parseAgentSet`/`serializeAgentSet`, and the invariant-enforcing mutators
+  a lifecycle verb calls: `insertAgent` (R1 id-shape + freshness, R2 name
+  availability at creation), `renameAgent` (**the function this ticket asks
+  for by name: refuses a rename onto a name held by a *different* agent,
+  naming the current holder's id in the message** — renaming onto the name
+  the same agent already holds is a no-op success, not a refusal), and
+  `deleteAgent` (R4: moves the id into `retiredIds` rather than discarding
+  it, so a re-mint can never collide even under unlucky randomness; the
+  agent's name is freed as a *consequence* of removal — nothing separately
+  "un-claims" it). Archived agents are ordinary entries in `agents` and are
+  found and refused against by `renameAgent` exactly like any other agent —
+  R2's "archived agents keep holding their name" and "unarchive can never
+  collide" hold because nothing here special-cases them, not because of a
+  check someone has to remember to add. `parseAgentSet` additionally rejects
+  a stored file with a duplicate name across two entries, or an id listed as
+  both active and retired — invariants enforced at the persisted-file
+  boundary too, not only through this module's own mutators.
+
+- **`agent-set-store.ts`** — the impure load/save half: atomic writes (temp
+  file + `rename`, same pattern as `registry-store.ts` and
+  `health/signal.ts`), and a loader with **three distinct, typed outcomes**
+  — `missing` (no file yet; the empty set; a *success*), `malformed`
+  (unreadable or failed to parse; a distinct typed failure), `loaded` (read
+  and parsed). **This is deliberately not a copy of `registry-store.ts`'s
+  `loadRegistry`**, which catches a malformed registry and falls back to
+  empty — correct *there*, because the session registry is reconstructable
+  from `claude`'s own live state on the next reconcile cycle. The agent set
+  has no such second source of truth; it is reconstructable from nothing. A
+  malformed file silently read as "empty" would make every agent the
+  operator ever created look deleted, and the very next save would then
+  overwrite the file that still held them. So this loader surfaces
+  `malformed` distinctly and never guesses "empty" on the caller's behalf.
+  **Reload-after-restart, demonstrated against a real file, not a mock**
+  (`test/unit/agent-set-store.test.ts`): write a set to a real temp
+  directory, drop the in-memory value, load it back from the same path in a
+  fresh call, get the same set back.
+
+- **`agent-resolver.ts`** — `resolveAgent(agentSet, query)`: an id-shaped
+  query resolves by id and never falls through to a name scan (R1's
+  "resolve id first, then name" — given R1 this can't change the *outcome*
+  for a well-formed set, but it keeps the rule legible without a reader
+  first having to convince themselves disjointness holds); otherwise it
+  scans by name, returning a typed `not-found` or the agent. **The
+  `ambiguous` case is kept, defensively, even though it is structurally
+  unreachable through every write path this codebase provides** (parse
+  rejects duplicate names; `insertAgent`/`renameAgent` both refuse them) —
+  it exists so the type stays honest for a caller holding an `AgentSet` that
+  did not come from one of those, rather than silently picking whichever
+  match came first. Later epics (a daemon API/CLI, attach, argv-drift) are
+  instructed to reuse this resolver rather than write a second one.
+
+### Which XDG base, and why (R5)
+
+The durable agent set lives under **`$XDG_STATE_HOME`**
+(`candlestixStateDir`/`agentSetPath` in `src/xdg.ts`, `src/paths.ts`) —
+deliberately not under `$XDG_RUNTIME_DIR` alongside the registry, health
+signal, and per-agent MCP config, and deliberately not merged with the
+registry file. Two files, two lifetimes, on purpose: the agent set is the
+thing only candlestix knows and must survive a reboot; the runtime-dir
+contents either are reconstructable from `claude`'s own live state (the
+registry) or are meant to die with the session (the health signal, the MCP
+config). Merging them would drag the durable half down to the ephemeral
+half's lifetime. Between state home and data home, this story went with
+state home as instructed by default: the XDG spec frames state home as
+"current state of the application that can be reused on a restart" — which
+matches an agent set (which agents exist, named what, toggled how, since
+when) more closely than data home's framing of user-authored content the
+operator would think to back up or migrate independently of candlestix
+itself. `resolveStateHome` already existed in `src/xdg.ts`, exported and
+unit-tested, with no production path consuming it before this story; this
+is that path.
 
 ## Known gaps — stated plainly, not implied away
 
@@ -643,6 +783,14 @@ real, not hypothetical, on the actual target host.
 - **Boot-at-startup**: the enablement/linger mechanism is verified; an
   actual reboot was not performed on the shared host this was built on.
   See "systemd user unit" above.
+- **No lifecycle verbs, no reserved-word list, on the durable agent set.**
+  `create`/`on`/`off`/`rename`/`archive`/`unarchive`/`delete`/`list`, and a
+  reserved-word check guarding a bare name against colliding with a future
+  CLI's own verb grammar, are explicitly a sibling story's scope — see "The
+  durable agent set" above for exactly what this story provides for that
+  story to call. Nothing spawns, persists, or exposes an agent set today;
+  `agent-set-store.ts`'s `loadAgentSet`/`saveAgentSet` are not yet wired
+  into `src/index.ts` or the supervisor loop.
 
 ## Tooling
 
