@@ -19,13 +19,21 @@ no "Done." That is the whole reason it is a separate product from `butchr`
 
 ## Status
 
-The supervisor loop is wired up end to end: candlestix reads the roster from
-its resolved on-disk path, keeps one blank agent alive per entry (spawning a
-missing one, re-adopting one that is already running, and never re-spawning
-one that just already exists), wires health honestly per the heartbeat
-contract below, and installs as a systemd user unit that starts at boot. See
-"Supervisor loop" and "Restart survival" below for what that means and what
-was and was not verified.
+**CNDLX-19 landed: the reconcile loop is desired-state driven, and the
+roster is retired.** candlestix now reads only the durable, daemon-owned
+agent set (`$XDG_STATE_HOME/candlestix/agents.json` — see "The durable
+agent set" below) to decide what should be alive. An agent recorded `off`
+or `archived` is never spawned, by any path, ever — the bug this story
+fixes is described in detail under "Supervisor loop" below. The roster
+file and every roster-driven code path (parser, loader, spawn path,
+name-keyed per-agent MCP config) are deleted, not merely unused; see
+"Legacy roster file (retired)".
+
+The full eight-verb lifecycle action set (`create`/`on`/`off`/`rename`/
+`archive`/`unarchive`/`delete`/`list`, `src/agent-actions.ts`) now has a
+consumer: the reconcile loop reads exactly the state these verbs write.
+Still deliberately absent: no CLI, no HTTP API, no webapp (CNDLX-15/16),
+no `attach` (CNDLX-3).
 
 ## Health (`src/health/`)
 
@@ -39,10 +47,19 @@ this section is a map to them, not a replacement for reading them.
   thrown, never because the process is merely still running. This is the
   fix for a real incident: a health endpoint that derived liveness from the
   *absence of an error callback* lied for fourteen hours while its loop was
-  silently dead. `registerSubject(subjectId)` separately marks a subject as
-  known (e.g. the roster says it should exist) without asserting it is
+  silently dead. `registerSubject(subjectId, displayName?)` separately marks
+  a subject as known (its recorded state is `on`) without asserting it is
   healthy — this is what lets "tracked, never completed a cycle" and
-  "never tracked at all" stay two different facts (see below).
+  "never tracked at all" stay two different facts (see below). **CNDLX-19
+  T3/T4**: `subjectId` is the agent's durable **id**, never its mutable
+  name — a name is carried only as an optional `displayName`, purely for a
+  human reading the health signal, and is never matched or keyed against
+  anywhere in this store. `unregisterSubject(subjectId)` (new in CNDLX-19)
+  removes a subject entirely and is idempotent; **only `on` agents are
+  ever subjects**, and an agent that leaves `on` (turned off, archived, or
+  deleted) is unregistered the very next cycle — see "Supervisor loop"
+  below for why this matters (an unbounded permanently-stale row is a real
+  regression, not a cosmetic one).
 
 - **`staleness.ts`** — `evaluateStaleness(lookup, now, thresholdMs)`, a
   **pure** function: no clock read, no filesystem, no I/O, no ambient state.
@@ -66,11 +83,14 @@ this section is a map to them, not a replacement for reading them.
   and logs at **ERROR** level (the documented floor for "loud" — it surfaces
   in the journal) when one is `stale`. It never fires for `unknown`: an
   alarm that cries wolf for everything it cannot see trains its operator to
-  ignore it. The returned `stop()` is the *only* way to clear the timer —
-  the timer id lives solely in a closure inside this module, never exposed
-  to or reachable from the `HeartbeatStore` interface, so the loop being
-  watched has no path back to silence its own alarm. `runAlarmTick` is the
-  pure-schedule-free tick logic the unit tests drive directly;
+  ignore it. Combined with `heartbeat.ts`'s `unregisterSubject` (above),
+  turning an agent off silences its alarm rather than leaving it stale
+  forever — the product's one real "an operator needs to look at this"
+  signal stays meaningful. The returned `stop()` is the *only* way to clear
+  the timer — the timer id lives solely in a closure inside this module,
+  never exposed to or reachable from the `HeartbeatStore` interface, so the
+  loop being watched has no path back to silence its own alarm. `runAlarmTick`
+  is the pure-schedule-free tick logic the unit tests drive directly;
   `scripts/verify-alarm.ts` is what actually proves the timer fires in a
   real process (see below — this is deliberately not something a unit test
   alone can prove).
@@ -86,8 +106,11 @@ this section is a map to them, not a replacement for reading them.
   `pid`) so a reader can tell "this signal never watched that subject" apart
   from "this signal watched it and it's stale" — a subject absent from
   `subjects` was never observed, full stop; it never appears as a
-  fabricated `stale` entry. Path: `$XDG_RUNTIME_DIR/candlestix/health.json`
-  (see "XDG paths" below) — printed at startup.
+  fabricated `stale` entry. Each subject entry also carries `agentName`
+  (CNDLX-19 T4) — the id alone is durable but illegible; the name rides
+  along for a human, and is `undefined` for a blank agent, never a key.
+  Path: `$XDG_RUNTIME_DIR/candlestix/health.json` (see "XDG paths" below) —
+  printed at startup.
 
 ### Proving the alarm actually fires
 
@@ -116,388 +139,467 @@ What it does and what to expect, in both directions:
    `process.exit()` call anywhere in the script. A hang, or an exit before
    ever logging, would mean one of the two capabilities is fake.
 
-The supervisor loop below is a second, live instance of the same proof: see
-"Demonstrations" for a real run where the alarm fires honestly during the
-genuine startup window before the first cycle completes, then falls silent
-once a real heartbeat lands.
+## Legacy roster file (retired — CNDLX-19 / R12)
 
-## Roster
+Before CNDLX-19, candlestix read an operator-edited roster file
+(`$XDG_CONFIG_HOME/candlestix/roster.yaml`) as the source of truth for
+which agents should exist. **That file is no longer read by any code path
+in this tree.** The parser (`src/roster.ts`), its impure loader
+(`src/roster-source.ts`), the roster-driven spawn path (`src/spawn.ts`),
+and the name-keyed legacy per-agent MCP config function CNDLX-18
+quarantined for this retirement (`legacyRosterMcpConfigPath`) are all
+**deleted**, along with their tests and the example roster
+(`examples/roster.yaml`) — not merely unused, gone.
 
-The roster is the operator-editable file that says which agents should
-exist. It is resolved from `$XDG_CONFIG_HOME/candlestix/roster.yaml`,
-falling back to `~/.config/candlestix/roster.yaml` when `$XDG_CONFIG_HOME`
-is unset **or empty** (`src/xdg.ts`, `src/paths.ts`) — re-read fresh at the
-start of every reconcile cycle, so an operator can edit the roster in place
-without restarting the daemon. An operator adds, edits, or removes an agent
-by editing that one YAML file directly; there is no second file to keep in
-sync, because the job description lives inline in the roster rather than as
-a path to a sibling file.
+**Why this overturns a recorded project decision, deliberately.** The
+CNDLX project root doc's 2026-09-02 decision was *"the roster, not a
+query, is the source of truth for what agents exist."* That premise held
+while creating, renaming, archiving, and deleting an agent were things an
+operator did by hand-editing a file. It stopped holding once CNDLX-18
+shipped those as **daemon actions** (`src/agent-actions.ts`): once the
+daemon writes the agent set itself, a hand-edited file sitting alongside
+it is a second source of truth that will silently disagree with the
+first. An import path from a legacy roster into the daemon-owned set is
+CLI-shaped work that belongs to CNDLX-15 if the human ever wants it;
+building it here was explicitly out of this epic's scope.
 
-**Removing an entry from the roster does not stop the agent it named.**
-candlestix only ever starts, adopts, and health-checks agents that are
-*currently* in the roster; an agent whose entry was deleted simply stops
-being tracked (no more heartbeat, no more health-signal entry) but is left
-running exactly as it is — the same "never tear an agent down without being
-told to" principle "Restart survival" below is built on. Stopping an agent
-on purpose is an operator action (`claude stop <id>`, see "Spawning agents"),
-not something removing a roster line does implicitly.
-
-`src/roster.ts` exports a pure function, `parseRoster(source: string):
-ParseRosterResult`, that turns the text of a roster file into a typed
-result. It touches no filesystem, environment, clock, or network — call it
-with a string and it always returns the same thing. It parses YAML with
-Bun's built-in `Bun.YAML.parse` (verified on Bun `1.3.14`: it exists, a `|`
-block scalar round-trips with its newlines intact, and malformed input
-throws a `SyntaxError` that `parseRoster` catches rather than letting
-propagate), so this repo still has zero runtime dependencies.
-
-```ts
-type ParseRosterResult =
-  | { ok: true; roster: Roster }
-  | { ok: false; errors: RosterError[] };
-```
-
-It never throws for invalid input — a hand-edited file being wrong is the
-expected case, not an exception — and it collects every error it finds
-rather than stopping at the first, so an operator can fix a roster in one
-pass. `Roster`, `RosterAgent`, `RosterError`, and `ParseRosterResult` are
-all exported for later stories to build on. `src/roster-source.ts` is the
-thin impure wrapper that reads the resolved path and calls `parseRoster`; a
-missing file is reported as an error (not silently treated as zero agents),
-so a typo'd path is distinguishable from a deliberately empty roster.
-
-### Format
-
-```yaml
-agents:
-  - name: release-notes
-    # `job` is the brief handed to the agent. Written as a block scalar (|)
-    # so multi-line prose keeps its line breaks instead of being escaped
-    # into one line.
-    job: |
-      Watch this repo's merged PRs and keep a running draft of release
-      notes, grouped under Added / Changed / Fixed.
-    cwd: /home/operator/code/brooswit-factory/candlestix
-    mcpServers:
-      github:
-        command: npx
-        args: ["-y", "@modelcontextprotocol/server-github"]
-        env:
-          GITHUB_TOKEN: "${GITHUB_TOKEN}"
-```
-
-Top level is a mapping with exactly one key, `agents`, whose value is a list
-of agent entries. `agents: []` is a valid roster with zero agents. Each
-entry has exactly four required fields, with no defaults:
-
-- **`name`** — non-empty string matching `^[a-z0-9][a-z0-9._-]*$`, and
-  unique across the roster. It is a durable identifier a later story uses to
-  name a session and a working area, so slashes, whitespace, and a leading
-  dash are rejected rather than tolerated.
-- **`job`** — non-empty (after trimming) string: the brief handed to the
-  agent via `--append-system-prompt` at spawn time (see "Spawning agents").
-- **`cwd`** — non-empty string that starts with `/`. The parser only checks
-  the *shape* of the value at parse time — that it is an absolute path —
-  never that the directory exists; existence is checked fresh, at spawn
-  time, every cycle (see "Supervisor loop"). A `cwd` that does not exist is
-  a clear, per-entry failure — logged loudly, no agent spawned for that
-  entry, every other entry unaffected.
-- **`mcpServers`** — a plain object mapping server name to server config.
-  Write `{}` explicitly when an agent has no MCP servers; the field is
-  required, not omittable, so an empty roster entry and an unset one can't
-  be confused.
-
-candlestix does not know what roles or agent "kinds" exist — there is no
-`type` or `role` field, and none is planned. The job description in the
-roster is the only place a role lives.
-
-An entry with a key outside those four (e.g. a typo like `cwdd`) is
-rejected, naming both the entry and the offending key — a silently-ignored
-typo would otherwise look to the operator like it worked.
-
-### MCP server validation
-
-The contents of `mcpServers` are passed through to another program (a
-Claude Code agent) that owns its own schema, so candlestix does not reject
-unknown keys inside a server config the way it does for the four top-level
-agent fields — that would force a candlestix release for every upstream MCP
-feature. It still validates the shape enough to catch a genuinely broken
-config:
-
-- `mcpServers` itself must be a plain object. A list, string, or `null` is
-  rejected.
-- Each server config must be a plain object, and must be identifiable as
-  *some* kind of server: a non-empty string `command` (a stdio server) or a
-  non-empty string `url` (an http/sse server). Neither `command` nor `url`
-  is required to also be present — a real http/sse config with only `url`
-  is valid.
-- If present, `args` must be an array of strings, and `env` must be an
-  object whose values are all strings.
-- Everything else in a server config passes through untouched.
-
-### Other validation rules
-
-- Source that is empty or whitespace-only is rejected.
-- The `agents` key must be present and must be a list; anything else is
-  rejected with a message saying what was expected.
-- Unknown keys at the top level (alongside `agents`) are rejected.
-- Malformed YAML is caught and reported as `ok: false`; `parseRoster` never
-  throws.
-
-Each `RosterError` names the offending entry (by index, and by name when
-the name itself is known and valid) and field where applicable, with a
-message that stands on its own without the caller reformatting it.
+**What happens if a legacy roster file still exists on disk.** It is
+**ignored, loudly** — not silently migrated (silent migration of a file
+the operator believes is authoritative would produce agents nobody asked
+for and hide that it did — the worst of the three options), and not
+refused-to-start (refusing to boot over a stale file an operator forgot
+about would turn an accident into an outage). Concretely, `src/index.ts`
+stats `legacyRosterPath()` (`src/xdg.ts`/`src/paths.ts` — the ONE function
+kept from the retired roster module, renamed to say what it is now for: a
+legacy path, referenced only by this warning, never a live input) once at
+startup. If the file exists, it logs one clear line naming the file's
+**full path**, saying it is no longer read, and saying what to do instead
+— **once per daemon start, never once per cycle**, since a warning
+repeated every 20 seconds is noise, and noise is how real warnings get
+filtered out. If the file does not exist, nothing is logged — warning
+about a file that is not there would itself be exactly that noise. See
+"Demonstrations" below for a real run showing this warning fire exactly
+once across two full reconcile cycles.
 
 ## Supervisor loop (`src/supervisor.ts`, `src/reconcile.ts`)
 
-Every `RECONCILE_INTERVAL_MS` (20s — see `src/index.ts` for the reasoning),
-candlestix loads the roster fresh and, for every entry, decides one of four
-actions (`src/reconcile.ts`'s `decideReconcileAction`, a **pure** function —
-no fs, no child_process, no clock read, tested directly in
-`test/unit/reconcile.test.ts` against every branch below without mocking
-anything):
+**CNDLX-19: the loop is desired-state driven.** Every
+`RECONCILE_INTERVAL_MS` (20s — see `src/index.ts` for the reasoning),
+candlestix loads the durable agent set fresh (`loadAgentSet`,
+`src/agent-set-store.ts` — CNDLX-17) and, for every agent it contains,
+decides one of six actions (`src/reconcile.ts`'s `decideReconcileAction`, a
+**pure** function — no fs, no child_process, no clock read, tested
+directly in `test/unit/reconcile.test.ts` against every branch below,
+exhaustively over the state axis, without mocking anything):
 
-- **`heartbeat`** — a live agent for this entry was found and *independently
-  verified*, per the heartbeat contract in `health/heartbeat.ts`.
-- **`spawn`** — no agent for this entry exists anywhere candlestix can see,
-  and its `cwd` exists. Launch a fresh one (see "Spawning agents").
-- **`wait`** — an agent is listed for this entry but candlestix could not
-  independently verify it is alive *this cycle*. No heartbeat, no spawn —
-  just wait for the next cycle. See "The false-healthy trap this caught
-  for real" below for why this branch exists and is not merely theoretical.
-- **`cwd-missing`** — no agent exists and the entry's `cwd` does not exist
-  either. Logged loudly, this entry only, every other entry unaffected.
+- **`heartbeat`** — a live session for an `on` agent was found and
+  *independently verified*, per the heartbeat contract in
+  `health/heartbeat.ts`.
+- **`spawn`** — an `on` agent has no live session anywhere candlestix can
+  see, and its directory exists. Launch a fresh one (see "Spawning
+  agents"). **This is the only action type that ever launches a session,
+  and it is reachable only when `state === "on"`** — the bug this story
+  fixes is that the pre-CNDLX-19 version of this function had no state
+  input at all and reached an equivalent branch unconditionally.
+- **`wait`** — an `on` agent has a session listed but candlestix could not
+  independently verify it is alive *this cycle*, OR more than one live
+  session matches its directory exactly with no registry match to break
+  the tie (T5 — see below). No heartbeat, no spawn, no guess — just wait
+  for the next cycle.
+- **`dir-missing`** — an `on` agent has no live session and its directory
+  does not exist either. Logged loudly, this agent only, every other agent
+  unaffected.
+- **`not-subject`** — an `off` or `archived` agent with no live session
+  under its directory. This is the expected, quiet steady state: nothing
+  to do, nothing to log.
+- **`unexpected-session`** — an `off` or `archived` agent **with** one or
+  more live sessions running under its directory anyway. See "Off/archived
+  with a stray session" below — this is a report-only action; the loop
+  never stops or removes anything.
 
-**"Found" and "independently verified" are two different checks, on
-purpose.** candlestix's primary source for "what agents exist" is `claude
-agents --json` (Claude Code's own scriptable listing of its background
-sessions — see "Spawning agents" for why this substrate was chosen). But
-per this ticket's own guidance — *"if your supervisor asks something else
-whether an agent is alive, you have moved the lie rather than removed
-it... treat that answer as a hint, not as truth"* — candlestix does not
-record a heartbeat on listedness alone. It additionally requires the listed
-entry to carry a `pid`, and independently confirms that pid with
-`kill(pid, 0)` (`src/proc.ts`) at the same moment the listing was fetched.
-Only when both hold does a cycle count as genuinely completed.
+### The bug this story fixes, precisely
 
-### The false-healthy trap this caught for real
+Before CNDLX-19, `ReconcileInputs` had no state field of any kind, and the
+last statement of `decideReconcileAction` was an unconditional
+`return { type: "spawn" }`, reached whenever nothing was found and the
+directory existed — regardless of whether an operator had just turned that
+agent off. The human's own framing of the bug:
 
-While building this, killing a background session's backing process live
-(to test crash detection) produced exactly the failure mode this ticket
-warns about, unprompted: `claude agents --json` kept listing the session —
-same `id`, same `sessionId` — but its `pid` field disappeared for a couple
-of seconds while Claude Code's own daemon transparently re-homed it onto a
-new backing process. A supervisor that read bare listedness as "alive"
-would have recorded a heartbeat for a session with **no verifiable backing
-process at that moment** — the exact shape of the fourteen-hour incident
-`health/heartbeat.ts`'s doc comment describes, just with a different
-upstream source lying about health instead of an absent error callback.
+> "Off" is a recorded intention, not merely an absence; a supervisor that
+> helpfully restarts an agent the operator turned off is the bug this
+> bullet exists to prevent.
 
-candlestix's `wait` branch is what this looks like when it works: a real
-run's log shows
+CNDLX-18 gave the operator an off switch (`turnOff`, `src/agent-actions.ts`)
+that stops the session. Before this story, the supervisor loop had no
+concept of that switch at all and would cheerfully undo it on the very
+next 20-second cycle. `state`, read fresh from the durable agent set every
+cycle, is the fix: `off` and `archived` never reach `spawn`, by
+construction — see the exhaustive `state !== "on"` tests in
+`test/unit/reconcile.test.ts`.
 
-```
-WARN "demo-agent": session "8589df43" is listed but claude's daemon
-     reported no pid for it this cycle; not recording a heartbeat this cycle
-```
-followed, once the daemon's self-heal completed and a real pid reappeared and
-verified alive, by a resumed heartbeat with no operator action taken. See
-"Demonstrations" for the full real log. This is also why
-`agents-cli.ts:parseAgentsJson` throws (rather than returning `[]`) on
-anything that is not the expected JSON array, and why a listing failure
-(`claude agents --json` erroring or timing out — observed live on this busy
-multi-agent host, see "Demonstrations") skips heartbeats for **every**
-roster entry that cycle rather than guessing: an empty or failed listing
-must never be read as "nothing is running," which would risk spawning
-duplicates for agents that are, in fact, alive.
+### The loop is SPAWN-ONLY — it never stops or removes a session
+
+`off`/`archived` mean "do not spawn." They do **not** authorise the loop
+to kill anything — there is no action type in `ReconcileAction` that means
+"stop this session." When a live session is found under an `off` or
+`archived` agent's directory anyway, the loop reports the disagreement
+loudly and takes no action on the session (`unexpected-session`, above).
+Three reasons, all load-bearing:
+
+- **The cgroup hazard is the single most likely way this product breaks
+  the host, and this loop would trip it automatically, on a timer, with
+  nobody watching.** The first `claude --bg` invocation for a Unix user
+  spawns a long-lived `claude daemon run` singleton that every later
+  `--bg` session on the host shares, inheriting the cgroup of its first
+  invoker (see the comment in `src/agent-spawn.ts`). A loop that kills a
+  cgroup on a timer takes down every background Claude session on the
+  machine, including other people's. `turnOff` and `deleteAgent`
+  (`agent-actions.ts`) already avoid this by issuing only `claude stop`/
+  `claude rm` per session, never touching a cgroup or a systemd scope —
+  but a periodic, unattended loop is exactly the kind of code that
+  eventually reaches for something blunter. The loop simply never gets
+  the chance: it has no verb that stops anything.
+- **The loop cannot distinguish "off, with a stray session" from "the
+  `off` record is stale because a store write failed right after a
+  start"** (see "What the loop does when the record disagrees with
+  reality" below). Stopping there could destroy a session an operator may
+  have just created; not stopping costs one visible, logged, recoverable
+  anomaly. The asymmetry is decisive.
+- **`turnOff` already stops the session.** The loop's job is to not undo
+  the operator's intention, not to re-enforce it on a timer.
+
+The report itself is deduplicated: `decideReconcileAction` reports the
+same fact every time it is asked (it is pure — no memory across calls),
+but `src/supervisor.ts` keeps a `Map<agentId, signature>` of the last
+warning issued per agent, threaded across cycles by `src/index.ts`, and
+only logs again when the set of offending session ids actually changes —
+a warning repeated every 20 seconds for an unchanged condition is noise,
+and noise is how real warnings get filtered out. See "Demonstrations"
+below for a live run showing exactly one warning across two consecutive
+cycles for an unresolved stray session.
+
+### Adoption keys on the directory, which is derived from the id
+
+`src/agent-directory.ts` (CNDLX-18) derives every daemon-created agent's
+directory from its minted id: `$XDG_STATE_HOME/candlestix/agents/<id>/`.
+Two named ambiguities CNDLX-1 recorded for the pre-CNDLX-19 roster world:
+
+- **"Two entries sharing a directory" (both adopt the same session,
+  neither spawns) disappears for free — scoped to candlestix's own
+  minted-directory model, not as a general claim.** Confirmed, not
+  merely assumed: `guardAgentDirectoryRemoval` and every path in
+  `src/xdg.ts`/`src/agent-directory.ts` derive an agent's directory as a
+  pure join of its **minted** id under a base directory candlestix itself
+  owns, and nothing in this tree ever accepts an operator-supplied
+  directory for an agent. Because candlestix mints the id AND owns the
+  directory namespace it is derived from, two agents cannot share a
+  directory — it is structural, not conventional. **This claim is
+  deliberately scoped to that precondition, not stated as "unique ids fix
+  directory-keyed adoption" in general**: a sibling project (bakr) runs
+  agents in directories that are *given*, not minted — several agents per
+  directory is its headline feature, not an edge case — and its root doc
+  binds it to never resolve, adopt, or reconcile an agent by directory
+  alone. The distinguishing property is **who owns the directory
+  namespace**: where the daemon mints the leaf from an id it owns
+  (candlestix), one-directory-one-agent is structural; where the directory
+  is given (bakr), it is not, and directory-keyed adoption there would be
+  unsound. A future shared substrate, if one is ever built, must carry
+  bakr's stricter invariant, not candlestix's looser one.
+- **"Two live sessions sharing one directory" does NOT disappear**, and is
+  not silently resolved by taking the first match. `src/agent-session.ts`'s
+  own rule for *stopping* a session is "every exact match" (CNDLX-18); that
+  rule has no meaning for *adoption* (you cannot adopt two). So
+  `decideReconcileAction` does not invent a competing rule either: when
+  more than one live session matches an `on` agent's directory exactly and
+  none matches the registry, the action is `wait` — report, never guess,
+  never spawn a duplicate next to an ambiguous pair. `claude`'s own
+  `--cwd` filter is documented as a **prefix** match, not an exact one; the
+  exact-match filter is applied client-side, in `src/reconcile.ts` and
+  `src/agent-session.ts` alike.
+
+### What the loop does when the record disagrees with reality
+
+`agent-actions.ts`'s verbs return a typed `store-write-failed` when the
+durable write fails *after* the session effect already happened — so an
+agent's recorded state can, in principle, be stale relative to a session
+that was just started or stopped. **The loop's ruling: it obeys the
+recorded state, always, with no heuristic override.** The recorded state
+*is* the desired state; a failed write means the intention was never
+recorded, and the operator was told so by a typed error at the moment it
+happened. A loop that infers intention from observed liveness would make
+liveness authoritative over the record — precisely the confusion this
+story exists to remove. What the loop owes instead is **visibility**: when
+`state` and what `claude agents --json` shows disagree, that surfaces as
+an ordinary `wait` (state `on`, nothing verifiably alive) or
+`unexpected-session` (state `off`/`archived`, something alive anyway) —
+never as this function second-guessing which one to believe. `decideOn`/
+`decideOff`'s own "no-change is a success, not a repair" rule
+(`agent-lifecycle.ts`) means the loop's honesty here is not undermined by
+the action layer quietly overwriting a disagreement either.
 
 ### The registry (`src/registry.ts`, `src/registry-store.ts`)
 
-candlestix keeps its own durable record of `roster agent name -> { id,
-sessionId, cwd, spawnedAt }` at
-`$XDG_RUNTIME_DIR/candlestix/registry.json`. **This registry is bookkeeping
-and an operator-visible audit trail — it is explicitly NOT the source of
-truth for liveness.** `claude agents --json`, cross-checked against a live
-`kill(pid, 0)` at read time, is the source of truth every cycle, always
-re-fetched fresh. If the registry file is lost, corrupted, or simply absent
-(first run), `decideReconcileAction`'s **adopt-by-cwd fallback** finds any
-already-running background session whose `cwd` matches the roster entry and
-adopts it instead of spawning a duplicate — the registry is safely
-reconstructable from `claude`'s own live state, by construction. This also
-means candlestix never carries a pid *across a reconcile cycle*: every
-cycle re-asks "what's alive right now" and only ever trusts a pid within
-the same instant it was reported. Two distinct claims, both true and worth
-keeping apart (see `src/reconcile.ts`'s doc comment on `verifiedAlivePids`
-for the same distinction at the code level): as a single check, this is
-*weaker* than pid+start-time pairing — it only rules out a pid that is
-already wrong the instant it was reported, not one that gets recycled
-later. But the *architecture* around it is stronger than what pid+start-time
-pairing exists to fix: there is no stale, candlestix-held pid sitting
-around *to* recycle in the first place, because none is ever carried
-between cycles.
+candlestix keeps its own durable record of `agent id -> { sessionShortId,
+sessionId, cwd, spawnedAt }` at `$XDG_RUNTIME_DIR/candlestix/registry.json`.
+**This registry is bookkeeping and an operator-visible audit trail — it is
+explicitly NOT the source of truth for liveness.** `claude agents --json`,
+cross-checked against a live `kill(pid, 0)` at read time, is the source of
+truth every cycle, always re-fetched fresh. If the registry file is lost,
+corrupted, or simply absent (first run), `decideReconcileAction`'s
+**adopt-by-directory fallback** finds any already-running background
+session whose `cwd` matches the agent's own directory and adopts it
+instead of spawning a duplicate — the registry is safely reconstructable
+from `claude`'s own live state, by construction.
+
+**CNDLX-19 T4 (H1) — re-keyed from the agent's mutable name to its durable
+id.** Before this story, this file was keyed by a roster agent's `name`;
+CNDLX-18 found and reported this (rather than fixing it, correctly, since
+it lived in exactly the modules this story rewrites) as the same bug class
+as R16's per-agent-MCP-config fix. The test CNDLX-18 applied throughout,
+inherited here: *does a rename cost durable data, or one recoverable
+cycle?* This one is the second kind — the registry is ephemeral and
+reconstructable from `claude`'s own live state — so it is fixed by simply
+re-keying the live shape rather than migrating the old one. A name is
+still carried, as `agentName` — a **display field only**, never a key,
+never matched against by `decideReconcileAction` or anything else in this
+tree.
+
+**A pre-CNDLX-19, name-keyed file on disk (version 1) is recognised as
+LEGACY, distinct from malformed, and discarded honestly.** The old parser
+accepted only `version: 1`; anything else was "malformed." A legacy file
+is perfectly well-formed *for its own, previous version* — calling it
+malformed would send an operator hunting for corruption that does not
+exist. `parseRegistry` (`src/registry.ts`) now distinguishes the two: a
+`version: 1` file whose entries match the exact old
+`{name, id, sessionId, cwd, spawnedAt}` shape is reported as `legacy`;
+anything else that fails to parse is `malformed`. `loadRegistry`
+(`src/registry-store.ts`) logs a distinct message for each — "superseded,
+discarding, self-heals this cycle" for legacy; "malformed, starting from
+empty" for genuine corruption — and both fall back to an empty registry,
+which is correct here (unlike the durable agent set — see below) because
+this file is reconstructable from nothing but `claude`'s own live state.
 
 Written under `$XDG_RUNTIME_DIR` — survives a candlestix restart, not a
-reboot — matching this ticket's requirement exactly, since the agents
-themselves do not survive a reboot either (see "Restart survival").
+reboot — matching the sessions themselves, which do not survive a reboot
+either (see "Restart survival").
 
-## Spawning agents (`src/spawn.ts`)
+## Spawning agents (`src/agent-spawn.ts`)
 
-A fresh blank agent is launched with:
+**The daemon-agent spawn path (`spawnDaemonAgent`, CNDLX-18) is the only
+spawn path left** — the roster-driven one (`src/spawn.ts`,
+`spawnBackgroundAgent`) is deleted along with the roster. A fresh blank
+agent is launched with:
 
 ```
-systemd-run --user --scope --unit=candlestix-launch-<name>-<random> \
+systemd-run --user --scope --unit=candlestix-launch-<id-without-@>-<random> \
   --collect --expand-environment=no -- \
-  claude --bg --append-system-prompt <job> --strict-mcp-config --mcp-config <path>
+  claude --bg [--append-system-prompt <job>] --strict-mcp-config --mcp-config <id-keyed path>
 ```
 
-run with the process's `cwd` set to the roster entry's `cwd`.
+run with the process's `cwd` set to the agent's own directory
+(`$XDG_STATE_HOME/candlestix/agents/<id>/`). `--append-system-prompt` is
+**omitted from argv entirely** when the agent has no `job` (R11) — never
+passed an empty string — since `job` is optional on a daemon-created
+agent, unlike a roster entry's (which was required).
 
-### Why `claude --bg`, not the hand-rolled `setsid`+`script` pty this ticket's
-### own investigation proposed
+### Why `claude --bg`
 
-The ticket's §6 findings (a real investigation, dated the same day this
-story was filed) concluded a blank interactive agent needs a real pty,
-built by hand with `setsid script -qfc ...`. Re-verifying that live
-surfaced a better-fitting, first-class primitive the investigation didn't
-cover: **`claude --bg`**, Claude Code's own background-session feature.
-Concretely, verified live rather than assumed from `--help` text:
+Verified live rather than assumed from `--help` text: `claude --bg` needs
+no controlling terminal at all, sidesteps the workspace-trust dialog
+(Claude Code's own docs: skipped whenever stdout is not a TTY, which a
+background session's stdout structurally never is), and gives candlestix
+`claude agents --json` / `attach <id>` / `logs <id>` / `stop <id>` /
+`rm <id>` for free — Claude Code's own maintained surface, not
+candlestix's own pty/log-capture code.
 
-- **No TTY required, at all** — `claude --bg ... < /dev/null` on a sandbox
-  with no controlling terminal returns immediately with
-  `backgrounded · <id> (idle — send a prompt to start)`. §6 Finding A
-  ("no TTY -> falls back to `--print` and exits") tested the bare
-  interactive path, not this documented, separate mode.
-- **Sidesteps the workspace-trust dialog.** A hand-built pty via
-  `setsid script` hits Claude Code's own first-run "do you trust this
-  folder?" prompt and blocks there forever with nothing to answer it —
-  verified live, this is a real dead end for that approach, not a
-  hypothetical. `--bg` does not: `claude --help` documents the trust
-  dialog as skipped whenever stdout is not a TTY, which a background
-  session's stdout structurally never is, and this was confirmed live (no
-  hang, immediate `idle` state).
-- **Gives candlestix `claude agents --json` / `attach <id>` / `logs <id>` /
-  `stop <id>` for free** — Claude Code's own maintained surface, not
-  candlestix's own pty/log-capture code. This is the concrete answer to
-  this ticket's "attachable in principle" requirement: **an operator can
-  run `claude attach <id>` today, right now, against any agent candlestix
-  spawned** (the `id` is in the registry and in `claude agents`). There is
-  no candlestix-specific attach *command* — none is needed, since Claude
-  Code's own `attach` already does the job — but there is also no
-  candlestix convenience wrapper for it yet (e.g. `candlestix attach
-  <roster-name>` translating a roster name to a session id); that
-  convenience layer is a real, separate seam this story does not build, not
-  a hidden gap.
+### The cgroup hazard, and where it actually lives
 
-### The cgroup hazard, and where it actually turned out to live
+The first-ever `claude --bg` invocation for a Unix user spawns a
+singleton process (`claude daemon run`) that every subsequent `--bg`
+session on the host shares, inheriting whatever cgroup its first invoker
+happened to be running in — verified by inspecting its `/proc/<pid>/cgroup`
+live. Had candlestix's own systemd service happened to be that first
+invoker, a later `systemctl --user restart candlestix` would SIGTERM that
+cgroup and take the shared singleton down with it — and by extension
+**every** background Claude Code session on the host, not just
+candlestix's own.
 
-This ticket's §7 flags `KillMode=control-group` (systemd's default) killing
-everything in a unit's cgroup on stop/restart as the single most likely
-place for a fake restart-survival claim, and asks for empirical
-verification rather than trusting the paragraph. That verification found
-the hazard one level up from where the ticket describes it: it is not
-`claude --bg`'s own process that is at risk (Claude Code's own background
-sessions are already children of a long-lived daemon of their own, reparented
-away from whatever invoked `--bg`), it's that daemon's **birth cgroup**.
-
-The first-ever `claude --bg` invocation for a Unix user spawns a singleton
-process (`claude daemon run`) that every subsequent `--bg` session on the
-host shares, and — verified by inspecting its `/proc/<pid>/cgroup` live —
-it inherits whatever cgroup its first invoker happened to be running in.
-Had candlestix's own systemd service happened to be that first invoker, a
-later `systemctl --user restart candlestix` would SIGTERM that cgroup and
-take the shared singleton down with it — and by extension **every**
-background Claude Code session on the host, not just candlestix's own, not
-only this one agent.
-
-`systemd-run --user --scope` around every launch is what avoids this: it
-moves the invocation (and, if it is the first ever, the singleton daemon it
-gives birth to) into its own independent, sibling cgroup under `app.slice`
-*before* candlestix's own service cgroup ever contains it. Verified live,
-under the real systemd unit (not just an ad-hoc process): a spawned agent's
-`/proc/<pid>/cgroup` reads
-`.../app.slice/candlestix-launch-demo-agent-<random>.scope`, never
-`.../app.slice/candlestix.service` — see "Demonstrations" for the
-restart test that depends on this and passed.
-
-`--expand-environment=no` is explicit, not left to the (current) default:
-`systemd-run` warns that a command line containing `$something` is "not
-expanded by default for now, but will be expanded by default in the
-future." An operator's job description is exactly the kind of free text
-that could contain a literal `$VAR`-looking sequence; pinning the flag
-makes today's non-expanding behaviour permanent regardless of that future
-default change.
+`systemd-run --user --scope` around every launch avoids this: it moves the
+invocation (and, if it is the first ever, the singleton daemon it gives
+birth to) into its own independent, sibling cgroup under `app.slice`
+*before* candlestix's own service cgroup ever contains it. **Verified live
+again during this story's own T8 demonstration** (see "Demonstrations"
+below): every spawned session's `/proc/<pid>/cgroup` read
+`.../app.slice/candlestix-launch-<id>-<random>.scope`, never
+`.../app.slice/candlestix-cndlx25-verify.service` (the scratch unit used
+for that demonstration).
 
 **Argv is never built as a shell string.** Every invocation goes through
 `src/exec.ts`'s `runCommand`, which calls `Bun.spawn` with an argv array —
 the job description, the mcp config path, everything, each its own array
-element, handed to `execve` directly. No `/bin/sh -c`, anywhere in the
-launch path, ever sees roster-derived text. An operator's job description
-containing quotes, `$`, backticks, or newlines needs no escaping and cannot
-break the command — verified with exactly such a string in
-`test/unit/spawn.test.ts`.
+element, handed to `execve` directly. No `/bin/sh -c` ever sees
+operator-supplied text.
 
 ### MCP config and `--strict-mcp-config`
 
-Each agent's `mcpServers` (from the roster) is written to its own file at
-`$XDG_RUNTIME_DIR/candlestix/agents/<name>/mcp.json` — **never into the
-roster's `cwd`**, which is the operator's own working directory, not
-candlestix's. `--strict-mcp-config` is passed so the agent's MCP servers
-are *exactly* the roster's declared set — no stray project-level or
-user-level MCP config leaking in, keeping what an agent can reach fully
-determined by its roster entry.
+A daemon-created agent's MCP config is written to
+`$XDG_RUNTIME_DIR/candlestix/agents/<id>/mcp.json` — **id-keyed** (R16),
+never keyed by the agent's mutable name (that call site,
+`legacyRosterMcpConfigPath`, was confined to the now-deleted roster spawn
+path and is deleted with it). `--strict-mcp-config` is passed so the
+agent's MCP servers are *exactly* what candlestix configured — today, an
+empty set (`{"mcpServers":{}}`, S6): no stray project-level or user-level
+MCP config leaks in. How an operator adds an MCP server to a daemon-created
+agent is unowned by any current story — this is intentional for now (the
+product's model is that setup happens in conversation) and is flagged
+rather than buried.
 
 ## Restart survival
 
-**The requirement, as ruled by the epic this story implements (CNDLX-8):
-agents OUTLIVE the daemon and are RE-ADOPTED across a `systemctl --user
-restart`, never killed and respawned.** The reasoning: candlestix
-deliberately knows nothing about roles (see above), so the conversation an
-operator has had with an agent *is* that agent's accumulated value — the
-only place its role exists in this product. Tearing an agent down on every
-daemon restart would destroy exactly what candlestix exists to preserve,
-silently, while still passing a naive reading of "the agent came back."
+**Agents OUTLIVE the daemon and are RE-ADOPTED across a `systemctl --user
+restart`, never killed and respawned — and, as of CNDLX-19, an agent
+turned `off` stays off across that same restart, never helpfully
+resurrected.** The reasoning: candlestix deliberately knows nothing about
+roles, so the conversation an operator has had with an agent *is* that
+agent's accumulated value. Tearing an agent down on every daemon restart,
+or reviving one the operator deliberately silenced, would each destroy
+exactly what candlestix exists to preserve.
 
-This holds here, and was **verified live under the real systemd unit**, not
-assumed:
-
-1. An agent is spawned; its session `id`, pid, and `/proc/<pid>/stat` field
-   22 (start time) are recorded.
-2. `systemctl --user restart candlestix` (or `candlestix-test` in the
-   verification run) is issued — a fresh daemon process comes up with a new
-   Main PID.
-3. The agent's pid **and its recorded start time are checked again** —
-   deliberately both, not just pid existence, because a bare "is this pid
-   present" check cannot distinguish a genuinely-surviving process from a
-   different, unrelated process that happened to reuse the same pid number
-   in between.
-
-Both matched, exactly, in the verification run (see "Demonstrations"). This
-works structurally, not by luck: every agent is a `claude --bg` background
+Structurally, not by luck: every agent is a `claude --bg` background
 session, a process tree that is a child of Claude Code's own persistent
 background-session daemon — not of candlestix — and living in its own
 `systemd-run --scope`, not candlestix's service cgroup (see "Spawning
-agents"). candlestix's shutdown (`src/index.ts`) reflects this directly:
-on `SIGINT`/`SIGTERM` it stops its own reconcile-loop timer, its own alarm,
-and its own health-signal timer, and does **nothing at all** to any spawned
-agent. Their defined fate on shutdown, restart, or a candlestix crash is:
-**left running, completely untouched, exactly where they are** — which is
-what makes the next startup's re-adoption possible at all.
+agents"). `src/index.ts`'s shutdown handler reflects this directly: on
+`SIGINT`/`SIGTERM` it stops its own reconcile-loop timer, its own alarm,
+and its own health-signal timer, and does **nothing at all** to any
+spawned agent. Their defined fate on shutdown, restart, or a candlestix
+crash is: left running, completely untouched, exactly where they are —
+which is what makes the next startup's re-adoption (or, for an `off`
+agent, the next startup's continued *non*-adoption) possible at all.
 
-`src/index.ts`'s old `shutdown()` — approved deliberately back when there
-was nothing to drain — called `process.exit(0)` immediately. That is gone;
-the replacement is described above and is what "gives spawned agents a
-defined fate" concretely means here.
+### The reboot claim, stated at exactly its real strength (R13)
 
-**What this does not cover, honestly, per the escape hatch the epic
-attached to this requirement (§7a):** a machine reboot is a different,
-separate epic — an agent's process does not, and is not claimed to, survive
-that, and the pid registry does not claim otherwise (see "The registry"
-above: it lives under `$XDG_RUNTIME_DIR`, which does not survive a reboot).
-Re-adoption **did** work end to end on the substrate actually installed
-here — this is not a case where the escape hatch had to be invoked to
-report a gap, but it is stated because the epic asked for the honest
-distinction either way, not an assumption that it would always hold on
-every substrate.
+**This host carries a live, shared fleet of other epics' in-progress
+work. Rebooting it to satisfy a checkbox would destroy real work to prove
+a standard mechanism, and was correctly declined**, following the same
+call CNDLX-1, CNDLX-17, and CNDLX-18 each made before this story. So the
+reboot property is proven **structurally, not by observing an actual
+reboot**:
+
+- The durable agent set lives under `$XDG_STATE_HOME`, not
+  `$XDG_RUNTIME_DIR` — a unit test (`test/unit/xdg.test.ts`,
+  `"agentSetPath does not move when only the runtime dir changes"`,
+  inherited from CNDLX-17) asserts the store's path is structurally
+  independent of the runtime dir, which is the thing a reboot actually
+  clears.
+- A **simulated reboot** — a fresh daemon process with `$XDG_RUNTIME_DIR`
+  wiped (registry and health signal both gone) but `$XDG_STATE_HOME`
+  untouched — reloads the exact same agent set with the exact same on/off
+  intentions, and re-adopts (never re-spawns) every still-live session
+  purely from directory-match adoption, since the registry that would
+  normally short-circuit that match no longer exists. **This was actually
+  done, live, under a real systemd restart — see "Demonstrations" below —
+  not merely reasoned about.**
+
+**The claim this story is entitled to make, precisely**: *the mechanism is
+verified to be correctly wired and demonstrated under a runtime-dir wipe.*
+That is deliberately **not** the same claim as *a host reboot was
+observed*. CNDLX-1's doc records that declaring this limit at exactly this
+strength is what made its own equivalent claim approvable, and a vaguer
+sentence would have been grounds to reject; that standard is inherited
+here unchanged.
+
+## Demonstrations
+
+Run 2026-09-10, against a **scratch** systemd user unit
+(`candlestix-cndlx25-verify.service`) and a **stubbed** `claude`
+(`/tmp/cndlx25-verify/bin/claude` — a bash+python3 script that fakes
+`--bg`/`agents --json`/`stop`/`rm` by forking a real, independently
+`kill(pid,0)`-verifiable detached process per "session" and tracking it in
+a JSON state file), never the real `claude` and never touching any real
+agent set, registry, or session. `$XDG_CONFIG_HOME`, `$XDG_STATE_HOME`,
+and `$XDG_RUNTIME_DIR` all pointed at a dedicated `/tmp/cndlx25-verify`
+tree, entirely separate from this daemon's own (unit `butchr.service`,
+unrelated). **Real sessions were not used**: they cannot be made to die on
+cue, and risk other epics' live work on this shared host; a stub session
+here IS a real, independently-verifiable OS process, just not a real
+`claude` invocation. This is stated plainly rather than left implicit —
+see "Standards you will be reviewed against" in this story's own ticket.
+
+Three agents were seeded directly into a scratch `agents.json`:
+`sleepy` (`off`), `steady` (`on`), `fragile` (`on`) — none pre-spawned.
+
+**Off stays off, on stays alive, and one that dies is brought back — all
+in the same run:**
+
+1. Daemon started. First cycle: `steady` and `fragile` each get a real
+   spawn (`INFO "steady" (...): spawn launched...`), each landing in its
+   own `candlestix-launch-<id>-<random>.scope`, confirmed via
+   `/proc/<pid>/cgroup` — distinct from the daemon's own
+   `candlestix-cndlx25-verify.service` cgroup. `sleepy` gets **no** spawn
+   attempt at all; its directory has no session, ever.
+2. Next cycle: both sessions independently verify alive; the registry
+   records real entries for both, keyed by agent id.
+3. `fragile`'s backing pid was killed with `SIGKILL` directly (simulating
+   a crash). The next cycle: `INFO "fragile" (...): spawn launched...` — a
+   **genuinely new** session, new pid, new registry `spawnedAt`.
+   `steady`'s pid was never touched.
+4. `systemctl --user restart candlestix-cndlx25-verify.service` — a real
+   restart, new Main PID. Immediately after: both `steady`'s original pid
+   and `fragile`'s just-replaced pid were **still alive**, untouched by
+   the restart. One reconcile cycle later: both re-adopted (no third
+   `spawn` log line for either), and `sleepy` remained `off` in
+   `agents.json`, with zero sessions ever recorded for it.
+
+**Off/archived with a stray session — reported, never touched:** a
+session was spawned directly (out of band, simulating an operator-created
+stray) under `sleepy`'s own directory. The next cycle logged exactly one
+`WARN "sleepy" (...): agent is "off" but 1 live session(s) are running
+under its directory (...) — the loop never stops a session on its own,
+only reports the disagreement`. The session was confirmed still running,
+untouched, after that cycle. The **following** cycle, with the condition
+unchanged, produced **no** repeated warning — T2's no-repeat rule, live.
+
+**The legacy roster warning — once per start, never per cycle:** a
+`roster.yaml` was placed at the scratch config path and the daemon
+restarted. The very next log line was `WARN legacy roster file found at
+"/tmp/cndlx25-verify/config/candlestix/roster.yaml" — it is NO LONGER
+READ. ...`. The agent set was unaffected (still exactly the 3 seeded
+agents, none named after the roster entry). One full cycle later, with
+the file still present and unchanged, the warning did **not** repeat.
+
+**The simulated reboot (R13):** with the daemon stopped, `$XDG_RUNTIME_DIR`
+was wiped entirely (registry and health signal both deleted) while
+`$XDG_STATE_HOME` was left untouched, then the daemon was started fresh.
+Both `steady`'s and `fragile`'s sessions (their real pids from step 3
+above) were confirmed alive immediately, and one cycle later the registry
+was rebuilt from scratch with the same two sessions, adopted by directory
+match (no registry to short-circuit through) — **no duplicate was ever
+spawned**, and `sleepy` was still `off`.
+
+**H2, observed again, live, in this story's own cleanup — not a
+production concern.** After stopping the scratch unit and killing both
+sessions' backing pids, their `candlestix-launch-*.scope` units remained
+`active (running)` for a few seconds before systemd garbage-collected
+them once their cgroups emptied — the same shape CNDLX-18 recorded for
+`claude bg-pty-host --bg-spare`. This loop never stops a session (see
+"The loop is SPAWN-ONLY" above), so it never needs "zero leftover
+candlestix processes" as a postcondition and this observation does not
+affect it — it matters only to verification cleanup, which is exactly
+where it showed up here, and cleanup simply waited for it rather than
+asserting cleanliness on the first check.
+
+**Host confirmed back at baseline** after every demonstration: the
+scratch unit file removed, `systemctl --user daemon-reload`'d, zero
+`candlestix-cndlx25-verify`/`candlestix-launch-*` units left in
+`systemctl --user list-units --all`, zero stray processes (`ps aux`
+checked), and the entire `/tmp/cndlx25-verify` tree removed. Confirmed by
+command, not assumed.
+
+**Suite/typecheck/build**, run on a fresh `bun install --frozen-lockfile`
+against this branch: **bun 1.3.14**, `bun run check` → **289 pass, 0
+fail**, typecheck clean, build clean. `package.json` still has no
+`dependencies` key.
 
 ## systemd user unit (`systemd/candlestix.service`)
 
@@ -512,12 +614,11 @@ systemctl --user enable --now candlestix.service
 ```
 
 The shipped unit's `ExecStart` points at `%h/code/brooswit-factory/candlestix`
-— the canonical clone location this ticket's own process document
+— the canonical clone location this project's own process document
 describes (`~/code/<owner>/<repo>`) — and its `PATH` is set explicitly
 (`%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin`) because a
 systemd user unit's `PATH` is **not** your login shell's, and `bun` in
-particular was found off the default `PATH` on the investigated host (this
-ticket's own §12).
+particular was found off the default `PATH` on the investigated host.
 
 ### `loginctl enable-linger` — starting at boot without a login
 
@@ -536,27 +637,24 @@ loginctl show-user "$(whoami)" -p Linger
 
 ### What "starts at boot" actually means here — verified vs. not
 
-This ticket names "starts at boot" as one of the two most likely places in
-this whole product for a fake capability, and is explicit that
-`systemctl --user is-enabled` is evidence about *enablement*, not about
-*boot*. Said plainly:
+This is one of the two most likely places in this whole product for a
+fake capability, and `systemctl --user is-enabled` is evidence about
+*enablement*, not about *boot*. Said plainly:
 
 - **Verified**: the unit installs, `daemon-reload`s cleanly, `enable`s
   (`systemctl --user is-enabled` reports `enabled`), and `start`s under
   real systemd supervision — not just `bun run` — with the expected
   `Main PID`, journal output flowing through `journalctl --user`, and
   (critically for restart survival) a spawned agent living in its own
-  sibling cgroup, never the unit's own. `loginctl enable-linger` was
-  already `yes` on the host this was verified against.
+  sibling cgroup, never the unit's own — re-confirmed live in this
+  story's own T8 demonstration (see "Demonstrations" above).
+  `loginctl enable-linger` was already `yes` on the host this was
+  verified against.
 - **Not verified**: an actual host reboot. This host runs a live, shared
   fleet of many other agents' in-progress work; rebooting it was out of
-  proportion to what this ticket needs and was not attempted. What *is*
-  verified — enablement plus linger plus the systemd semantics those two
-  combine to produce — is the standard, well-documented mechanism by which
-  a `WantedBy=default.target` user unit starts at boot; this is stated as
-  "the mechanism is verified to be correctly wired," not as "a reboot was
-  observed to work," and the two are being kept honestly distinct rather
-  than the first quietly standing in for the second.
+  proportion to what this story needs and was not attempted — the same
+  call CNDLX-1 made and this story inherits, stated at the same precise
+  strength (see "The reboot claim" above).
 
 ### `journalctl` — the sharp edge that looks like an empty log, not an error
 
@@ -570,497 +668,205 @@ journalctl --user -u candlestix.service
 journalctl --user -u candlestix.service -f   # follow
 ```
 
-(Do not confuse this with `butchr.service` or `herdr.service` — the
-investigated host already runs both, as user units, and they are different
-processes from candlestix entirely. Every `journalctl`/`systemctl` command
-above targets `candlestix.service` specifically.)
+(Do not confuse this with `butchr.service` or `herdr.service` — a host may
+run both, as user units, and they are different processes from
+candlestix entirely.)
 
 ## XDG paths (`src/xdg.ts`, `src/paths.ts`)
 
 | What | Path | Survives |
 |---|---|---|
-| Roster (operator-edited, read-only to candlestix) | `$XDG_CONFIG_HOME/candlestix/roster.yaml`, falling back to `~/.config/candlestix/roster.yaml` | reboot |
-| Registry | `$XDG_RUNTIME_DIR/candlestix/registry.json` | daemon restart, not reboot |
+| Legacy roster file (retired — CNDLX-19/R12, no longer read by anything) | `$XDG_CONFIG_HOME/candlestix/roster.yaml`, falling back to `~/.config/candlestix/roster.yaml` | n/a — checked once at startup only, to name it in a warning |
+| Registry (id-keyed, CNDLX-19 T4) | `$XDG_RUNTIME_DIR/candlestix/registry.json` | daemon restart, not reboot |
 | Health signal | `$XDG_RUNTIME_DIR/candlestix/health.json` | daemon restart, not reboot |
-| Per-agent MCP config, roster-driven agent (CONDEMNED — `legacyRosterMcpConfigPath`, R16) | `$XDG_RUNTIME_DIR/candlestix/agents/<name>/mcp.json` | daemon restart, not reboot |
-| Per-agent MCP config, daemon-created agent (`agentMcpConfigPath`, R16) | `$XDG_RUNTIME_DIR/candlestix/agents/<id>/mcp.json` | daemon restart, not reboot |
+| Per-agent MCP config (`agentMcpConfigPath`, R16, id-keyed) | `$XDG_RUNTIME_DIR/candlestix/agents/<id>/mcp.json` | daemon restart, not reboot |
 | Durable agent set | `$XDG_STATE_HOME/candlestix/agents.json`, falling back to `~/.local/state/candlestix/agents.json` | **reboot** |
-| **Per-agent directory** (CNDLX-23, S1) | `$XDG_STATE_HOME/candlestix/agents/<id>/`, same fallback base | **reboot** |
-
-CNDLX-23 (this story's own work — see "The lifecycle action set" below)
-re-keyed the per-agent MCP config for a **daemon-created** agent from the
-agent's mutable **name** to its immutable **id** — verified still
-name-keyed, with exactly one production call site (the roster's own spawn
-path), at this story's own commit before the fix. That one remaining
-name-keyed call site is kept, deliberately, as its own loudly-named
-function (`legacyRosterMcpConfigPath`) rather than folded into the id-keyed
-one: the roster's agents have no id at all, so the id-keyed function could
-never serve that call site anyway, and CNDLX-19 retires the whole roster
-path, this function included. **No per-agent path for a daemon-created
-agent is keyed by a mutable name any more** — proven the same way "rename
-never moves the directory" is proven: rename an agent, assert its
-directory path and its MCP config path are both unchanged (see
-`test/unit/agent-actions.test.ts`'s rename tests). One further name-keyed
-structure was found and NOT fixed, deliberately — see "Known gaps" below.
+| Per-agent directory (CNDLX-23, S1) | `$XDG_STATE_HOME/candlestix/agents/<id>/`, same fallback base | **reboot** |
 
 `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` set to the **empty
 string** are treated identically to unset (`src/xdg.ts`, unit-tested) — a
-real case on some systems, not a hypothetical, per this ticket. When
-`XDG_RUNTIME_DIR` is unset or empty, candlestix falls back to a
-uid-scoped subdirectory of the OS tmpdir (`src/paths.ts`); this has weaker
-durability guarantees than a real `XDG_RUNTIME_DIR` (most tmpdirs are also
-reboot-cleared, which is fine, but are not guaranteed stable across every
-daemon restart the same way) and is documented here as a fallback, not
-presented as equivalent. `XDG_RUNTIME_DIR` was set
-(`/run/user/<uid>`) and `XDG_STATE_HOME` was unset on the host this was
-verified against — both cases this table's fallback column depends on are
-real, not hypothetical, on the actual target host.
+real case on some systems, not a hypothetical. When `XDG_RUNTIME_DIR` is
+unset or empty, candlestix falls back to a uid-scoped subdirectory of the
+OS tmpdir (`src/paths.ts`); this has weaker durability guarantees than a
+real `XDG_RUNTIME_DIR` and is documented here as a fallback, not presented
+as equivalent.
 
 ## The durable agent set (`src/agent.ts`, `src/agent-id.ts`, `src/agent-set.ts`, `src/agent-set-store.ts`, `src/agent-resolver.ts`)
 
-The roster above is the operator-authored *config* for a fleet of identical,
-role-less blank agents. This is the bottom layer of a different model,
-landing underneath it: the daemon itself creating, naming, renaming, turning
-on/off, archiving, and deleting agents — state candlestix writes about
-itself, not state an operator hand-edits. **This story delivers only the
-record, id minting, the durable store (with its invariants), and the
-id/name resolver — no CLI, no HTTP, no lifecycle verb.** A sibling story
-builds `create`/`on`/`off`/`rename`/`archive`/`unarchive`/`delete`/`list` on
-top of what is described here; those verbs are expected to call the
-functions this section documents rather than re-decide any of it.
+Delivered by CNDLX-17: the record, id minting, the durable store (with its
+invariants), and the id/name resolver.
 
 - **`agent.ts`** — the `AgentRecord` type (`id`, optional `name`, optional
   `job`, a flat `state: "on" | "off" | "archived"`, `createdAt`) and
-  `validateAgentNameSyntax`, a pure, standalone name-syntax check. It is
-  exported on its own — not folded into a bigger "validate a rename"
-  function — specifically so a later CLI epic can layer a reserved-word
-  check (`on`, `off`, `name`, `archive`, `delete` as verbs a bare name could
-  collide with in the CLI's own grammar) on top without forking these rules.
-  That reserved-word list is deliberately **not** implemented here — it
-  belongs to the `create`/`rename` actions, not to name syntax itself.
-  Character set is the existing roster name pattern's, reused verbatim
-  (`[a-z0-9][a-z0-9._-]*`), plus a length bound (1-63 chars, this story's own
-  call — an unbounded name is an easy accidental footgun). "Deleted" is
-  represented by absence from the store, not as a fourth state value — see
-  `agent-set.ts` below.
+  `validateAgentNameSyntax`, a pure, standalone name-syntax check.
+  "Deleted" is represented by absence from the store, not as a fourth
+  state value — see `agent-set.ts` below.
 
 - **`agent-id.ts`** — `mintAgentId({ now, random })`, pure, with clock and
-  randomness as injected parameters (this tree's existing convention — see
-  `staleness.ts`, `xdg.ts`). `random` is a `[0,1)` float — exactly
-  `Math.random`'s own contract, deliberately not "an integer digit in
-  [0, 32)" as an earlier version of this function asked for: that contract
-  silently broke on the single most obvious thing to pass it. Caught in
-  review, with a probe: `Math.floor` of any `[0,1)` value is always `0`, so
-  passing `Math.random` straight through collapsed the entire random part to
-  zeros and produced byte-identical ids for two agents minted in the same
-  millisecond — `isAgentId` still accepted the result, and no test caught it
-  because every test already injected a conforming source. Fixed by changing
-  the contract itself rather than adding a runtime check, so `Math.random` is
-  correct by construction; a regression test
-  (`test/unit/agent-id.test.ts`) mints twice through `Math.random` in the
-  same millisecond and asserts the ids differ. A minted id is `@` followed by
-  18 Crockford-base32 characters (10 encoding the mint timestamp, 8 random —
-  a ULID-shaped id, sized down since only per-process uniqueness was needed,
-  not global cross-machine sortability). **Why `@`, concretely:** R1 (id and
-  name spaces disjoint *by construction*) needs a property that survives
-  without relying on the name grammar's leading-character class — the
-  existing roster name pattern starts with a letter *or digit*, so a
-  leading-digit-means-id convention would have required tightening it.
-  `@` sidesteps that: it is a character `AGENT_NAME_PATTERN`'s charset
-  excludes at *every* position, not just the first, so no valid name can
-  ever collide with an id regardless of how the name grammar's own leading
-  character class is defined. `#` was considered and rejected — it starts a
-  shell comment as the first character of an unquoted word, exactly wrong
-  for "an operator can type this at a shell" (this ticket's own
-  requirement); `@` has no such shell hazard and reads naturally aloud.
-  `isAgentId(value)` is the structural (store-free) shape check the resolver
-  and the store both use. **Proof, not assertion**
-  (`test/unit/agent-name-id-disjoint.test.ts`): 1000 ids minted through the
-  real minter are each checked against the real name validator (all
-  rejected), and the converse — 1000 validator-accepted names, randomly
-  generated within the grammar plus hand-picked edge cases — are each
-  checked against `isAgentId` (none accepted).
+  randomness as injected parameters. A minted id is `@` followed by 18
+  Crockford-base32 characters (10 encoding the mint timestamp, 8 random).
+  `isAgentId(value)` is the structural (store-free) shape check the
+  resolver, the store, and `src/reconcile.ts`/`src/agent-directory.ts` all
+  use.
 
 - **`agent-set.ts`** — the pure half of the store: `AgentSet` (`{ version:
   1, agents: Record<id, AgentRecord>, retiredIds: string[] }`),
   `parseAgentSet`/`serializeAgentSet`, and the invariant-enforcing mutators
-  a lifecycle verb calls: `insertAgent` (R1 id-shape + freshness, R2 name
-  availability at creation), `renameAgent` (**the function this ticket asks
-  for by name: refuses a rename onto a name held by a *different* agent,
-  naming the current holder's id in the message** — renaming onto the name
-  the same agent already holds is a no-op success, not a refusal), and
-  `deleteAgent` (R4: moves the id into `retiredIds` rather than discarding
-  it, so a re-mint can never collide even under unlucky randomness; the
-  agent's name is freed as a *consequence* of removal — nothing separately
-  "un-claims" it). Archived agents are ordinary entries in `agents` and are
-  found and refused against by `renameAgent` exactly like any other agent —
-  R2's "archived agents keep holding their name" and "unarchive can never
-  collide" hold because nothing here special-cases them, not because of a
-  check someone has to remember to add. `parseAgentSet` additionally rejects
-  a stored file with a duplicate name across two entries, or an id listed as
-  both active and retired — invariants enforced at the persisted-file
-  boundary too, not only through this module's own mutators.
+  a lifecycle verb calls: `insertAgent`, `renameAgent`, `deleteAgent` (R4:
+  moves the id into `retiredIds` rather than discarding it, so a re-mint
+  can never collide even under unlucky randomness).
 
-- **`agent-set-store.ts`** — the impure load/save half: atomic writes (temp
-  file + `rename`, same pattern as `registry-store.ts` and
-  `health/signal.ts`), and a loader with **three distinct, typed outcomes**
-  — `missing` (no file yet; the empty set; a *success*), `malformed`
-  (unreadable or failed to parse; a distinct typed failure), `loaded` (read
-  and parsed). **This is deliberately not a copy of `registry-store.ts`'s
-  `loadRegistry`**, which catches a malformed registry and falls back to
-  empty — correct *there*, because the session registry is reconstructable
-  from `claude`'s own live state on the next reconcile cycle. The agent set
-  has no such second source of truth; it is reconstructable from nothing. A
-  malformed file silently read as "empty" would make every agent the
-  operator ever created look deleted, and the very next save would then
-  overwrite the file that still held them. So this loader surfaces
-  `malformed` distinctly and never guesses "empty" on the caller's behalf.
-  **Reload-after-restart, demonstrated against a real file, not a mock**
-  (`test/unit/agent-set-store.test.ts`): write a set to a real temp
-  directory, drop the in-memory value, load it back from the same path in a
-  fresh call, get the same set back.
+- **`agent-set-store.ts`** — the impure load/save half: atomic writes, and
+  a loader with **three distinct, typed outcomes** — `missing` (no file
+  yet; the empty set; **a success**, per CNDLX-19 T1), `malformed`
+  (unreadable or failed to parse; a distinct typed failure that **must
+  never be treated as "no agents"** — see "Supervisor loop" above for how
+  the reconcile loop honours this by skipping the entire cycle rather than
+  guessing), `loaded` (read and parsed).
 
 - **`agent-resolver.ts`** — `resolveAgent(agentSet, query)`: an id-shaped
-  query resolves by id and never falls through to a name scan (R1's
-  "resolve id first, then name" — given R1 this can't change the *outcome*
-  for a well-formed set, but it keeps the rule legible without a reader
-  first having to convince themselves disjointness holds); otherwise it
-  scans by name, returning a typed `not-found` or the agent. **The
-  `ambiguous` case is kept, defensively, even though it is structurally
-  unreachable through every write path this codebase provides** (parse
-  rejects duplicate names; `insertAgent`/`renameAgent` both refuse them) —
-  it exists so the type stays honest for a caller holding an `AgentSet` that
-  did not come from one of those, rather than silently picking whichever
-  match came first. Later epics (a daemon API/CLI, attach, argv-drift) are
-  instructed to reuse this resolver rather than write a second one.
+  query resolves by id and never falls through to a name scan; otherwise
+  it scans by name, returning a typed `not-found` or the agent.
 
 ### Which XDG base, and why (R5)
 
-The durable agent set lives under **`$XDG_STATE_HOME`**
-(`candlestixStateDir`/`agentSetPath` in `src/xdg.ts`, `src/paths.ts`) —
-deliberately not under `$XDG_RUNTIME_DIR` alongside the registry, health
-signal, and per-agent MCP config, and deliberately not merged with the
-registry file. Two files, two lifetimes, on purpose: the agent set is the
-thing only candlestix knows and must survive a reboot; the runtime-dir
-contents either are reconstructable from `claude`'s own live state (the
-registry) or are meant to die with the session (the health signal, the MCP
-config). Merging them would drag the durable half down to the ephemeral
-half's lifetime. Between state home and data home, this story went with
-state home as instructed by default: the XDG spec frames state home as
-"current state of the application that can be reused on a restart" — which
-matches an agent set (which agents exist, named what, toggled how, since
-when) more closely than data home's framing of user-authored content the
-operator would think to back up or migrate independently of candlestix
-itself. `resolveStateHome` already existed in `src/xdg.ts`, exported and
-unit-tested, with no production path consuming it before this story; this
-is that path.
+The durable agent set lives under **`$XDG_STATE_HOME`**, deliberately not
+under `$XDG_RUNTIME_DIR` alongside the registry, health signal, and
+per-agent MCP config. Two files, two lifetimes, on purpose: the agent set
+is the thing only candlestix knows and must survive a reboot; the
+runtime-dir contents either are reconstructable from `claude`'s own live
+state (the registry) or are meant to die with the session (the health
+signal, the MCP config).
 
 ## The lifecycle action set (`src/agent-lifecycle.ts`, `src/agent-directory.ts`, `src/agent-session.ts`, `src/agent-spawn.ts`, `src/agent-actions.ts`)
 
-CNDLX-23, on top of everything in "The durable agent set" above: the eight
-verbs — `create`, `on`, `off`, `rename`, `archive`, `unarchive`, `delete`,
-`list` — as plain callable functions over CNDLX-17/22's record, store and
-resolver. **No CLI, no HTTP, no API, no UI** (CNDLX-15's scope) and
-**`attach` is not built** (CNDLX-3's scope, left a seam). Wiring the
-supervisor/reconcile loop to obey these states — reading the agent set,
-calling these actions on drift, retiring the roster — is explicitly
-**CNDLX-19's**, not this story's: nothing here is called from
-`src/index.ts` or `src/supervisor.ts`.
+Delivered by CNDLX-18, on top of everything in "The durable agent set"
+above: the eight verbs — `create`, `on`, `off`, `rename`, `archive`,
+`unarchive`, `delete`, `list` — as plain callable functions. **As of
+CNDLX-19, the state these verbs write is exactly what the reconcile loop
+reads** — see "Supervisor loop" above. Still no CLI, no HTTP, no API, no
+UI (CNDLX-15's scope), and `attach` is still not built (CNDLX-3's scope,
+left a seam).
 
-- **`agent-lifecycle.ts`** — the PURE transition rules (R9), split from the
-  effects that apply them. `decideOn`/`decideOff`/`decideArchive`/
-  `decideUnarchive`/`decideDelete` each take only the current
-  `AgentLifecycleState` and return a typed decision: a refusal (R8, with a
-  message that names why — e.g. turning an archived agent on names
-  `unarchive` in its refusal), an idempotent `no-change` (the diagonal:
-  `on` of an already-on agent, `off` of an already-off one — reported as an
-  explicit success, never a silent no-op and never a refusal), or a
-  transition naming the effect it requires (`start-session`,
-  `stop-session`, or `none`). `unarchive` always lands on `off`, never
-  `on`. `delete` is legal unconditionally from any state. Also here:
-  `checkAgentNameAllowed` (R17), layering the reserved-word refusal on top
-  of CNDLX-17's standalone `validateAgentNameSyntax` exactly the way that
-  module's own doc comment invites, rather than forking the syntax rule.
-  **R17's own open question — "the five CLI verbs, or the whole action-set
-  vocabulary" — is settled here as the whole vocabulary**: `create`,
-  `attach`, `on`, `off`, `rename`, `name`, `archive`, `unarchive`, `delete`,
-  `list`. Reasoning carried over from the epic: reserving a word later
-  breaks any agent already holding it; un-reserving one later breaks
-  nothing — so the cheap, reversible direction is the superset now, even
-  though `attach`/`unarchive`/`list` have no CLI verb yet. Exhaustively
-  unit-tested over all three states for every verb, including every refusal
-  (`test/unit/agent-lifecycle.test.ts`).
+- **`agent-lifecycle.ts`** — the PURE transition rules (R9): `decideOn`/
+  `decideOff`/`decideArchive`/`decideUnarchive`/`decideDelete`, each a
+  total function of the current `AgentLifecycleState`. `unarchive` always
+  lands on `off`, never `on`. `delete` is legal unconditionally. Also
+  here: `checkAgentNameAllowed` (R17), the reserved-word list
+  (`create`, `attach`, `on`, `off`, `rename`, `name`, `archive`,
+  `unarchive`, `delete`, `list` — the whole action-set vocabulary, not
+  just the CLI verbs, since reserving a word later is a breaking change
+  for any agent already holding it).
 
-- **`agent-directory.ts`** — S1's per-agent directory
-  (`$XDG_STATE_HOME/candlestix/agents/<id>/`, one level below `agents.json`
-  — see the XDG table above) and S3's guarded recursive removal.
-  `guardAgentDirectoryRemoval` is **pure** (no fs access) and is what makes
-  the guard "a test, not a comment": it refuses unless the argument is
-  structurally a minted id (`isAgentId`) and refuses unless the path it
-  derives is a direct child of the agents base directory — fed hostile
-  inputs (`""`, `".."`, `"../../etc/passwd"`, an absolute path, the base
-  dir itself, an id-shaped string with a smuggled `/` or `..`) and asserted
-  to refuse **and leave real files on disk untouched**, not merely to
-  return an error (`test/unit/agent-directory.test.ts`). The second check
-  (direct-child) is structurally unreachable through anything that already
-  passes the first, given `isAgentId`'s alphabet — kept anyway, as
-  deliberate belt-and-suspenders rather than evidence it is dead, the same
-  reasoning `agent-resolver.ts`'s `ambiguous` case already used. Removal
-  uses `force: true` so "already gone" is a success, not an error — that is
-  idempotence, not error-swallowing; a real removal failure (permissions, a
-  race) still surfaces as `{ ok: false, reason }`.
+- **`agent-directory.ts`** — the per-agent directory
+  (`$XDG_STATE_HOME/candlestix/agents/<id>/`) and guarded recursive
+  removal. `guardAgentDirectoryRemoval` is **pure** and refuses unless the
+  argument is structurally a minted id and the derived path is a direct
+  child of the agents base directory.
 
-- **`agent-session.ts`** — S2 + R7: finds an agent's live `claude --bg`
-  session(s) by its **directory**, via `claude agents --json --cwd <dir>`,
-  never through a registry keyed by name. `--cwd` is documented as a
-  *prefix* match ("under `<path>`"); this module re-filters to an **exact**
-  match itself rather than trusting the flag alone — verified live at this
-  story's own `claude` version (see "R7's live demonstration" below).
-  `stopSession`/`removeSession` call exactly `claude stop <id>` / `claude
-  rm <id>` — the per-session verbs `claude` itself provides — and nothing
-  here ever shells out to `systemctl` or signals a cgroup. **S2's
-  ambiguity ruling, made explicit rather than silently taking the first
-  match**: if more than one live session's cwd matches an agent's directory
-  exactly, `stopAllSessionsUnderCwd`/`stopAndRemoveAllSessionsUnderCwd` act
-  on **every** match, because the state being reached ("no live session
-  under this directory") is the same regardless of which one, if any, was
-  "the real one" — leaving a second one running would silently contradict
-  the store's own "off" recording. A session that fails to stop is never
-  then handed to `rm` (S3: never remove a conversation that might still be
-  live).
+- **`agent-session.ts`** — finds an agent's live `claude --bg` session(s)
+  by its **directory** (never a name-keyed registry), stops/removes them
+  with exactly `claude stop <id>` / `claude rm <id>` — never `systemctl`,
+  never a cgroup. Stopping acts on **every** exact directory match, not
+  just the first.
 
-- **`agent-spawn.ts`** — `spawnDaemonAgent`, the spawn entry point for a
-  daemon-created `AgentRecord`, sibling to (not a replacement for)
-  `spawn.ts`'s roster-driven `spawnBackgroundAgent`. **R11, the live fix
-  this story owns**: `job` is optional on an `AgentRecord`; where absent,
-  `--append-system-prompt` is **omitted from argv entirely**, never passed
-  an empty string — verified at this story's own commit that the
-  roster-driven path still passes it unconditionally (correct there: a
-  roster entry's `job` is required, and that path is retired with the
-  roster by CNDLX-19, not fixed here). **S6**: writes `{"mcpServers":{}}`
-  at the id-keyed MCP path and keeps `--strict-mcp-config` — an agent gets
-  exactly the MCP servers candlestix configured (none, today) and nothing
-  ambient. How an operator adds an MCP server to an agent is **unowned by
-  any current story** — this is intentional (the product's own model is
-  that MCP setup happens in conversation) and is flagged here so it stays
-  visible rather than buried. Every launch is still wrapped in its own
-  `systemd-run --user --scope --expand-environment=no`, for exactly the R7
-  reasons already documented under "Spawning agents" above.
+- **`agent-spawn.ts`** — `spawnDaemonAgent`, the daemon-created-agent spawn
+  entry point (R11: `job` optional, `--append-system-prompt` omitted
+  entirely when absent; S6: an empty, `--strict-mcp-config`-enforced MCP
+  config).
 
-- **`agent-actions.ts`** — the eight verbs themselves, wiring the above
-  together with CNDLX-17/22's store, resolver and mutators. The shared
-  shape, applied uniformly: load the store (a `malformed` result refuses
-  **every** action outright — never treated as empty, tested for all eight
-  verbs in `test/unit/agent-actions.test.ts`); resolve `<id-or-name>`
-  through `resolveAgent` when the verb takes one; consult the pure decision
-  in `agent-lifecycle.ts`; apply the effect (session stop/start, directory
-  create/remove); **persist the store write only after every effect has
-  succeeded** — so a failed spawn or a failed stop never leaves the durable
-  store recording an intention this same call just learned is false. The
-  REVERSE direction — every effect succeeds, and the store write itself
-  then fails — is handled too, not left as an unhandled rejection: every
-  `saveAgentSet` call is wrapped and reported as a typed `store-write-failed`
-  error naming exactly which effect already happened, so the caller knows
-  reality and the store may now disagree. **Found live, in review, not by
-  reasoning**: an unwrapped `saveAgentSet` in `turnOff` meant a session that
-  really stopped, followed by a failed persist (probed with a `chmod`'d
-  state directory), threw instead of returning an error — leaving the store
-  still recording `"on"` for an agent CNDLX-19's reconcile loop would then
-  respawn, which is verbatim the bug the human's "recorded intention" model
-  exists to prevent. All seven `saveAgentSet` call sites are now wrapped and
-  tested for this failure (`test/unit/agent-actions.test.ts`'s "a failed
-  store WRITE is reported honestly" block, using the same real-`chmod`
-  technique, not a mock) — `create`'s case is the one exception that rolls
-  back for real (stops the just-started session, removes the
-  just-created directory) rather than only reporting, because a write
-  failure there leaves an id nowhere in the store: no later retry could
-  ever revisit it to clean it up, unlike every other verb, where the record
-  still exists and a retry (or a later `delete`) can.
-  - `create`: mints an id, then directory, then record, then — if
-    `initialState` (defaulted to `"on"`, S5) says so — the start effect.
-    A failed start rolls back: the just-created directory is removed and
-    **nothing is ever written to the store** (verified: after a simulated
-    spawn failure, `loadAgentSet` still reports `missing`, and the agents
-    directory is empty). Accepts no name and no job at all — the blank
-    agent, this product's headline case.
-  - `rename`: touches only the store's `name` field. Never touches
-    `agentDirectoryPath` or `agentMcpConfigPath` — both are keyed by `id`,
-    not `name` — so "a rename never moves the directory" (and, post-R16,
-    never moves the MCP config either) holds **by construction**, not by
-    remembering not to touch them. Verified directly: rename an agent,
-    assert both paths are byte-identical before and after.
-  - `delete`: S3's exact order — stop the live session (if any, by exact
-    directory) → remove it and its conversation (`claude rm`) → remove the
-    directory (guarded, see `agent-directory.ts`) → `deleteAgent` in the
-    store (retires the id, frees the name). **Every step is idempotent**,
-    so a retry after a crash between any two steps completes correctly
-    with no double-effect: a second `stopAndRemoveAllSessionsUnderCwd` call
-    finds nothing and succeeds trivially once the session is already gone;
-    a second `removeAgentDirectory` call succeeds trivially
-    (`force: true`) once the directory is already gone. Verified live that
-    the directory is **actually** gone by an independent `stat()` call, not
-    by the absence of an error.
-  - `list`: a plain projection over the store — `state` is on every record
-    already, so CNDLX-15 (hide archived from the main list) and CNDLX-16
-    (an Archived tab) need no second query (R10).
+- **`agent-actions.ts`** — the eight verbs themselves: load the store (a
+  `malformed` result refuses every action outright), resolve
+  `<id-or-name>`, consult the pure decision, apply the effect, **persist
+  the store write only after every effect has succeeded** — and when the
+  store write itself then fails, report a typed `store-write-failed`
+  naming exactly which effect already happened, rather than leaving an
+  unhandled rejection or a silently-stale record.
 
-### R7's live demonstration
+## H1/H2/H3 — CNDLX-18's three handoff findings, each explicitly handled
 
-Run against a **scratch** tree (a temp directory standing in for
-`XDG_STATE_HOME`/`XDG_RUNTIME_DIR`), never a real operator's agent set, and
-only ever touching two sessions this demonstration itself spawned
-(`demo-agent-a`, `demo-agent-b`) — the full "before" listing was captured
-first and diffed against after, per the safety rules this ticket sets.
-Every command and its real output is quoted in the PR description. What was
-shown, live, on this story's own host:
+CNDLX-18 surfaced these during its own work, judged each out of its own
+scope, and reported rather than silently fixed or dropped. Each is
+addressed here, explicitly, per this story's own acceptance criteria:
 
-- Two agents `on`; turning one **off** left the other's session and pid
-  **unaffected** (same pid before/after, independently re-verified via
-  `kill(pid, 0)`), left the shared `claude daemon run` singleton's pid
-  **unaffected**, left the turned-off agent's directory **in place**, and
-  recorded `state: "off"` durably.
-- `on` started a fresh session again; `archive` stopped and hid a session;
-  **`on` of an archived agent was refused** (not silently unarchived);
-  `unarchive` returned it to `off`, **never `on`**, and started no session.
-- `delete` on both agents left **no directory** for either — checked by an
-  independent `stat()` after cleanup, not by the absence of an error — and
-  the host's full `claude agents --json` listing (19 sessions, all
-  pre-existing interactive ones on this shared, busy host) was
-  byte-identical before and after.
-- **One genuine finding, stated at its real strength**: after the demo's
-  last `claude rm`, a transient `systemd-run --scope` unit
-  (`candlestix-launch-<id>-*`) was observed still `active (running)` for
-  up to roughly 15-30 seconds, containing not the agent's session itself
-  but a `claude bg-pty-host --bg-spare` helper process — an internal,
-  undocumented (from this codebase's own comments) pre-warming mechanism
-  `claude --bg` appears to use for faster future launches. It self-resolved
-  with **no operator action** within that window and required no
-  `systemctl` intervention (the demo never used one, per the hard safety
-  rule) — observed once, not measured as a bound the way
-  `docs/review-commit-immutability.md`'s 30-56s figure was. Recorded here
-  rather than silently waited out, because "the scope was gone eventually"
-  and "the scope was gone the instant `claude rm` returned" are different
-  claims, and CNDLX-19's own reconcile loop should not assume the latter.
-- This demonstration ran against `claude` 2.1.267 and `bun` 1.3.14 on this
-  story's own host; both are worth re-checking on a different host per this
-  ticket's own instructions.
+- **H1 (the name-keyed session registry) — FIXED.** See "The registry"
+  above: re-keyed from the agent's mutable name to its durable id, with a
+  recognised-legacy-format file discarded under its own honest message
+  rather than called malformed. The in-process heartbeat subject was
+  re-keyed the same way, for the same reason (see `health/heartbeat.ts`
+  above) — the same bug class, fixed in the same story for the same
+  reason: both live in the exact modules this story rewrites anyway.
+
+- **H2 (a transient `claude bg-pty-host --bg-spare` helper outliving
+  `claude rm` by roughly 15-30s, observed once, not a measured bound) —
+  HANDLED BY CONSTRUCTION, not by a wait or a postcondition check.** Under
+  T2, this loop never stops or removes a session at all — it has no verb
+  that could need "zero leftover candlestix processes" as a postcondition
+  in the first place. It resurfaced, live, in this story's own
+  verification *cleanup* (not in the product's own runtime) — see
+  "Demonstrations" above — which is exactly why H2 flagged that any
+  "nothing was left behind" assertion needs a second look rather than a
+  glance, and this doc gives it one.
+
+- **H3 (`store-write-failed` as a real staleness signal) — HANDLED, with
+  the ruling stated explicitly.** See "What the loop does when the record
+  disagrees with reality" above: the loop obeys the recorded state
+  unconditionally and surfaces any disagreement as visibility (`wait` /
+  `unexpected-session`), never as an inference that overrides the record.
 
 ## Known gaps — stated plainly, not implied away
 
 - **No candlestix-specific attach convenience.** `claude attach <id>` /
   `logs <id>` / `stop <id>` work today against any agent candlestix
-  spawned (see "Spawning agents"); a `candlestix`-side command that
-  translates a roster *name* to its current session id is a real,
-  separate seam this story does not build.
-- **Argv-drift correctness on wake is out of scope** (a separate epic, per
-  this ticket). Not observed to be broken during this story's own testing
-  — every re-adopted agent's `/proc/<pid>/cmdline` matched its original
-  launch argv exactly — but candlestix does not defend against or detect
-  drift if it ever occurs.
-- **Reboot survival is a separate epic.** An agent's process, and
-  candlestix's own registry, do not survive a reboot; only a daemon
-  restart is covered (see "Restart survival").
-- **Ambiguous adoption**: if two *different* background Claude Code
-  sessions happen to share the exact same `cwd`, `decideReconcileAction`'s
-  cwd-adoption fallback adopts whichever one `claude agents --json`
-  happens to list first. Not defended against further; roster `cwd`s are
-  expected to be distinct per agent in practice. The mirror case is also
-  real and also not defended against: if *two roster entries* name the
-  same `cwd`, both would adopt the same live session and neither would
-  ever spawn — indistinguishable, from candlestix's side, from "working as
-  intended" until an operator notices only one agent exists for two names.
+  spawned; a `candlestix`-side command that translates an agent's name to
+  its current session id is a real, separate seam CNDLX-15 builds.
+- **Argv-drift correctness on wake is out of scope** (a separate epic).
+  Not observed to be broken during this or prior stories' own testing, but
+  candlestix does not defend against or detect drift if it ever occurs.
+- **Reboot survival is proven structurally, not observed** — see "The
+  reboot claim" above. This is a decision, stated at its exact strength,
+  not a gap left unexamined.
+- **Ambiguous adoption, scoped precisely (T5, see "Adoption keys on the
+  directory" above):** two roster entries sharing a directory is retired
+  by construction in candlestix's own minted-directory model; two live
+  sessions sharing one directory is not, and is handled by `wait` rather
+  than guessing.
 - **The `wait` action is deliberately unbounded — this is a decision, not
-  an oversight.** When a candidate is listed by `claude agents --json` but
-  its `pid` cannot be independently verified this cycle (see "The
-  false-healthy trap this caught for real"), candlestix waits and tries
-  again next cycle, indefinitely — there is no consecutive-cycle counter
-  and no escalation to spawning a replacement. The alternative — falling
-  through to `spawn` after some bound of consecutive `wait`s — was
-  considered and rejected: it can create a genuine duplicate background
-  session next to one that was never actually dead, only slow to
-  re-verify, which is a strictly worse failure than staying stuck (it
-  silently doubles an agent instead of loudly reporting zero). `wait`
-  never fabricates health, either way: the heartbeat simply stops, the
-  subject goes `stale`, and `startStalenessAlarm` gets loud on its own —
-  the alarm, not a retry bound, is the intended operator-facing signal for
-  this state. See `src/reconcile.ts`'s doc comment for the same reasoning
-  at the code level.
-- **Nudge verification, startup-dialog answering (beyond the workspace-trust
-  skip `--bg` already gets for free), and session-limit recognition are all
-  out of scope**, per this ticket.
-- **Boot-at-startup**: the enablement/linger mechanism is verified; an
-  actual reboot was not performed on the shared host this was built on.
-  See "systemd user unit" above.
-- **The lifecycle action set exists but is wired into nothing.** CNDLX-23
-  delivered `create`/`on`/`off`/`rename`/`archive`/`unarchive`/`delete`/
-  `list` as plain functions (see "The lifecycle action set" above) —
-  nothing calls them from `src/index.ts` or the supervisor loop, the
-  durable agent set is not read by the reconcile cycle, and the roster is
-  not retired. All of that is **CNDLX-19's**, by this ticket's own explicit
-  instruction not to take it: do not rewrite `decideReconcileAction`, do
-  not make the loop read the agent set, do not retire the roster.
-- **`attach` is not built.** Left a seam, per CNDLX-3's ownership of it —
-  and per R18 (arrived after this story was filed), that seam is shaped as
-  **one query, not an act**: resolve `<id-or-name>`, decide whether it is
-  attachable right now, return the live session identity — never "open a
-  terminal and attach," which is the caller's concern (a CLI execs in
-  place; a daemon-owned webapp path spawns a window), not candlestix
-  core's. `agent-session.ts`'s `findAgentSessions` already **is** that
-  query — R18 names it explicitly as the same lookup S2 already specifies,
-  one implementation for both callers, not a second. What this story does
-  NOT add: the attach-specific refusals R18 describes (an `off` or
-  `archived` agent has no session to attach to and would be refused, never
-  silently started) — no caller exists yet to refuse on behalf of, and
-  adding them here with no caller would be scope this ticket does not
-  claim.
-- **No CLI, no HTTP daemon API, no webapp** call any of this yet — CNDLX-15
-  and CNDLX-16's scope. The action set (`agent-actions.ts`) is the seam
-  they are meant to build on.
-- **One more name-keyed structure was found and deliberately NOT fixed**:
-  `src/registry.ts`'s session registry (`Registry.agents`) is keyed by the
-  roster agent's **name**, the same bug class as the MCP-config path R16
-  fixed. Not fixed here, on purpose, for two reasons: it is *ephemeral and
-  reconstructable* from `claude`'s own live state on the very next
-  reconcile cycle (a rename orphaning an entry costs one self-healing
-  cycle, not durable data — unlike the MCP path, which R16 fixed because
-  losing it silently was a durability bug), and it is written by the
-  reconcile/supervisor modules CNDLX-19 is about to rewrite to be
-  desired-state driven. Fixing it here would collide with that rewrite in
-  the same files for no durability gain. Searched for a **third** instance
-  of the same bug class (any per-agent path or state keyed by a mutable
-  label rather than an id) and found none beyond these two;
-  `spawn.ts`'s `unitName` is built from a roster agent's name too, but a
-  systemd-run unit name is a one-shot launch identifier scoped to a single
-  spawn call, not durable per-agent state a rename could ever orphan, so it
-  does not fit this bug class.
+  an oversight.** There is no consecutive-cycle counter and no escalation
+  to spawning a replacement. The alternative — falling through to `spawn`
+  after some bound of consecutive `wait`s — was considered and rejected:
+  it can create a genuine duplicate background session next to one that
+  was never actually dead, only slow to re-verify, which is a strictly
+  worse failure than staying stuck. `wait` never fabricates health,
+  either way: the heartbeat simply stops, the subject goes `stale`, and
+  `startStalenessAlarm` gets loud on its own.
+- **Nudge verification, startup-dialog answering (beyond the
+  workspace-trust skip `--bg` already gets for free), and session-limit
+  recognition are all out of scope.**
+- **The lifecycle action set is now wired in (CNDLX-19) — this bullet
+  used to say the opposite and is corrected here rather than left stale.**
+  `src/index.ts`/`src/supervisor.ts` read the durable agent set every
+  cycle; see "Supervisor loop" above.
+- **`attach` is not built.** Left a seam, per CNDLX-3's ownership of it,
+  shaped as **one query, not an act** (R18): resolve `<id-or-name>`,
+  decide whether it is attachable right now, return the live session
+  identity — never "open a terminal and attach," which is the caller's
+  concern. `agent-session.ts`'s `findAgentSessions` already **is** that
+  query.
+- **No CLI, no HTTP daemon API, no webapp** call any of this yet —
+  CNDLX-15 and CNDLX-16's scope.
 - **How an operator adds an MCP server to a daemon-created agent is
   unowned by any current story.** S6 gives every daemon-created agent an
-  empty MCP config and keeps `--strict-mcp-config`; the product's own model
-  is that this happens in conversation, but no verb or surface configures
-  it yet. Flagged explicitly rather than left implicit.
-- **The `claude bg-pty-host --bg-spare` finding** (see "R7's live
-  demonstration" above): a transient helper process and its wrapping
-  systemd scope can outlive `claude rm` by roughly 15-30 seconds before
-  self-resolving. Observed once, not measured as a reliable bound. Neither
-  `agent-session.ts` nor `agent-directory.ts` waits for or checks this —
-  they only need `claude`'s own tracked session state, which is already
-  correct by the time `claude stop`/`rm` return; this is recorded as an
-  open question for whoever eventually needs "the host has zero leftover
-  candlestix processes" as a hard, checkable postcondition (CNDLX-19's
-  reconcile loop, most plausibly), not as a defect in this story's own
-  actions.
-- **The R7 live demonstration used a scratch state/runtime tree and this
-  story's own host**, which — per the ticket's own framing — slightly
-  narrows what it proves: it did not run inside candlestix.service's own
-  cgroup, and no real reboot was performed (same honest gap CNDLX-17
-  already recorded for the durable store).
-- **Bun version**: this story's own suite, typecheck, and build were run on
-  bun **1.3.14** (`bun --version`), the same version CNDLX-17 verified
-  against, not the target laptop's 1.3.11. No bun API newer than what
-  CNDLX-17 already used was added by this story's own modules — checked by
-  inspection (`node:fs/promises`, `node:path`, `node:crypto`, `Bun.spawn`,
-  all already in use elsewhere in this tree), not by running the suite on
-  1.3.11 itself.
+  empty MCP config and keeps `--strict-mcp-config`; no verb or surface
+  configures it yet.
+- **Bun version**: this story's own suite, typecheck, and build were run
+  on bun **1.3.14** — see "Demonstrations" above for the exact numbers.
+  The target laptop runs bun 1.3.11 (tracked as CNDLX-20, not this
+  story's to fix); nothing added by this story relies on any bun API
+  newer than what CNDLX-17/CNDLX-18 already used
+  (`node:fs/promises`, `node:path`, `node:crypto`, `Bun.spawn`,
+  `JSON`/`Map`/`Set` — all already in use elsewhere in this tree before
+  this story).
 
 ## Tooling
 
@@ -1069,9 +875,9 @@ TypeScript in strict mode and `tsc --noEmit` as the typecheck gate. This
 matches every other repo in `brooswit-factory` — none of them use a linter,
 so this repo doesn't either; strictness comes from `tsconfig.json` instead
 (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
-`noImplicitOverride`). Zero runtime npm dependencies, including in this
-story's additions — `systemd-run`, `claude`, and `kill(pid, 0)` are shelled
-out to / called via Node's own `process.kill`, never installed as packages.
+`noImplicitOverride`). Zero runtime npm dependencies — `systemd-run`,
+`claude`, and `kill(pid, 0)` are shelled out to / called via Node's own
+`process.kill`, never installed as packages.
 
 ## Commands
 
@@ -1087,9 +893,10 @@ bun run check                   # typecheck + test + build, in that order
 ## CI
 
 `.github/workflows/ci.yml` runs `typecheck`, `test`, and `build` on every
-push, pull request, and manual dispatch. Note this ticket's own §12 blind
-spot: `engines.bun` in `package.json` is `>=1.3.14` (the roster uses Bun's
-built-in `Bun.YAML`), but CI pins `bun-version: latest`, so **CI structurally
-cannot verify that floor** — a regression against the stated minimum would
-pass CI regardless. This was true before this story and remains true after
-it; not something this story introduces or fixes.
+push, pull request, and manual dispatch. Note a standing blind spot:
+`engines.bun` in `package.json` is `>=1.3.14` (the roster used to rely on
+Bun's built-in `Bun.YAML`; nothing in the current tree still does, but the
+floor has not been lowered), while CI pins `bun-version: latest`, so **CI
+structurally cannot verify that floor** — a regression against the stated
+minimum would pass CI regardless. This predates this story and is
+unchanged by it.

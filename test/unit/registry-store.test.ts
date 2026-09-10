@@ -6,8 +6,9 @@ import { loadRegistry, saveRegistry, pathExists } from "../../src/registry-store
 import { emptyRegistry, upsertRegistryEntry, type RegistryEntry } from "../../src/registry";
 
 const entry: RegistryEntry = {
-  name: "a",
-  id: "abc",
+  agentId: "@0000000000abcdefghj",
+  agentName: "a",
+  sessionShortId: "abc",
   sessionId: "abc-full",
   cwd: "/tmp",
   spawnedAt: "2026-09-02T00:00:00.000Z",
@@ -24,6 +25,30 @@ describe("registry-store", () => {
     try {
       const path = join(dir, "registry.json");
       await writeFile(path, "{not json", "utf8");
+      const registry = await loadRegistry(path);
+      expect(registry).toEqual(emptyRegistry());
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("CNDLX-19 T4: loadRegistry discards a recognised pre-CNDLX-19 legacy (version 1, name-keyed) file and starts empty — not treated as malformed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "candlestix-registry-"));
+    try {
+      const path = join(dir, "registry.json");
+      const legacy = {
+        version: 1,
+        agents: {
+          "release-notes": {
+            name: "release-notes",
+            id: "179b2dfc",
+            sessionId: "179b2dfc-full",
+            cwd: "/home/operator/code/candlestix",
+            spawnedAt: "2026-09-02T00:00:00.000Z",
+          },
+        },
+      };
+      await writeFile(path, JSON.stringify(legacy), "utf8");
       const registry = await loadRegistry(path);
       expect(registry).toEqual(emptyRegistry());
     } finally {

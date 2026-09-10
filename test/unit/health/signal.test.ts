@@ -20,9 +20,10 @@ describe("buildHealthSnapshot", () => {
     expect(typeof snapshot.scope.host).toBe("string");
     expect(snapshot.scope.pid).toBe(process.pid);
     expect(snapshot.subjects).toEqual([
-      { subjectId: "healthy-one", verdict: "healthy", lastHeartbeat: new Date(NOW.getTime() - 1_000).toISOString() },
+      { subjectId: "healthy-one", agentName: undefined, verdict: "healthy", lastHeartbeat: new Date(NOW.getTime() - 1_000).toISOString() },
       {
         subjectId: "stale-one",
+        agentName: undefined,
         verdict: "stale",
         lastHeartbeat: new Date(NOW.getTime() - THRESHOLD_MS - 1).toISOString(),
       },
@@ -36,6 +37,17 @@ describe("buildHealthSnapshot", () => {
     const snapshot = buildHealthSnapshot(store, NOW, THRESHOLD_MS);
 
     expect(snapshot.subjects.map((s) => s.subjectId)).toEqual(["only-this-one"]);
+  });
+
+  test("CNDLX-19 T4: carries the store's display name for legibility — an id-only signal an operator cannot map back to an agent is a regression", () => {
+    const store = createHeartbeatStore();
+    store.recordHeartbeat("@01agentid", new Date(NOW.getTime() - 1_000), "release-notes");
+
+    const snapshot = buildHealthSnapshot(store, NOW, THRESHOLD_MS);
+
+    expect(snapshot.subjects).toEqual([
+      { subjectId: "@01agentid", agentName: "release-notes", verdict: "healthy", lastHeartbeat: new Date(NOW.getTime() - 1_000).toISOString() },
+    ]);
   });
 });
 
@@ -94,7 +106,7 @@ describe("startHealthSignalWriter", () => {
         listTrackedSubjects(): string[] {
           throw new Error("a store method that fails unexpectedly");
         },
-        getHeartbeat: () => ({ tracked: false, lastHeartbeat: null }),
+        getHeartbeat: () => ({ tracked: false, lastHeartbeat: null, displayName: undefined }),
       };
 
       let errors = 0;

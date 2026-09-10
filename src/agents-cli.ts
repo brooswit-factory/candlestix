@@ -34,12 +34,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 /**
  * Pure parser: JSON text in, typed list out. Throws on input that is not a
- * JSON array — deliberately, unlike `parseRoster`'s "collect errors, never
- * throw" convention, because the roster is hand-edited (wrong input is the
- * expected case) while this is machine output from a specific CLI contract
- * (`--json`); a caller that gets something else back needs to treat the
- * whole read as failed, not silently proceed with an empty list — an empty
- * list here is indistinguishable from "nothing is running" and would risk
+ * JSON array — deliberately, unlike `parseAgentSet`'s "collect a typed
+ * error, never throw" convention, because a hand-edited file expects wrong
+ * input as the ordinary case, while this is machine output from a specific
+ * CLI contract (`--json`); a caller that gets something else back needs to
+ * treat the whole read as failed, not silently proceed with an empty list
+ * — an empty list here is indistinguishable from "nothing is running" and
+ * would risk
  * spawning duplicates for agents that are, in fact, alive. See
  * `listBackgroundAgents` below for how the throw is turned into "we don't
  * know this cycle" rather than "nothing is running".

@@ -28,11 +28,10 @@ export function currentXdgInputs(): xdg.XdgInputs {
   };
 }
 
-export const rosterPath = (): string => xdg.rosterPath(currentXdgInputs());
+/** CNDLX-19 / R12: no longer read by anything — kept only so the startup warning can name the legacy file's full path. See xdg.ts. */
+export const legacyRosterPath = (): string => xdg.legacyRosterPath(currentXdgInputs());
 export const registryPath = (): string => xdg.registryPath(currentXdgInputs());
 export const healthSignalPath = (): string => xdg.healthSignalPath(currentXdgInputs());
-/** CONDEMNED — see xdg.ts. Confined to the roster-driven spawn path. */
-export const legacyRosterMcpConfigPath = (agentName: string): string => xdg.legacyRosterMcpConfigPath(currentXdgInputs(), agentName);
 /** R16: id-keyed, id-validated. */
 export const agentMcpConfigPath = (agentId: string): string => xdg.agentMcpConfigPath(currentXdgInputs(), agentId);
 export const agentSetPath = (): string => xdg.agentSetPath(currentXdgInputs());

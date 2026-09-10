@@ -11,16 +11,22 @@
 // target host's class of systems, not a hypothetical.
 //
 // CNDLX-23 / R16: `agentMcpConfigPath` below USED TO take an agent NAME and
-// build a path under it — verified still true at this ticket's own commit,
+// build a path under it — verified still true at that ticket's own commit,
 // with exactly one production call site (the roster-driven supervisor spawn
-// path). That collides head-on with "a rename never moves an agent's
+// path). That collided head-on with "a rename never moves an agent's
 // directory or its other per-agent state" once names become mutable
 // labels. Re-keyed to take a minted id instead, id-validated so a caller
-// cannot silently pass a name by accident. The one remaining name-keyed
-// call site is `legacyRosterMcpConfigPath`, kept as its own loudly-named
-// function rather than folded into the id-keyed one — it is confined to the
-// roster-driven spawn path CNDLX-19 owns retiring along with the roster
-// itself, and is now impossible to mistake for the live, id-keyed path.
+// cannot silently pass a name by accident.
+//
+// CNDLX-19 / T6: the roster, the roster-driven spawn path, and the
+// name-keyed per-agent MCP config path CNDLX-18 quarantined for exactly
+// this retirement (`legacyRosterMcpConfigPath`) are all gone — deleted, not
+// kept. `rosterPath` below is the ONE exception, per the ticket's own
+// instruction: R12's startup warning must name the legacy file's full
+// path, so something must still compute it. Renamed to `legacyRosterPath`
+// so a later reader cannot mistake it for a live input — it is referenced
+// from exactly one place (src/index.ts's one-time startup check) and is
+// never used to read the file it points at.
 
 import { isAgentId } from "./agent-id";
 
@@ -56,8 +62,15 @@ export function resolveRuntimeDir(inputs: XdgInputs): string {
   return orFallback(inputs.runtimeDir, inputs.runtimeFallbackBase);
 }
 
-/** `$XDG_CONFIG_HOME/candlestix/roster.yaml`, falling back per the resolvers above. */
-export function rosterPath(inputs: XdgInputs): string {
+/**
+ * `$XDG_CONFIG_HOME/candlestix/roster.yaml`, falling back per the
+ * resolvers above. CNDLX-19 / R12 / T6: this file is NO LONGER READ by any
+ * code path — the roster it named is retired. This function survives
+ * solely so `src/index.ts`'s one-time startup check can name the legacy
+ * file's full path in its warning when one is found on disk; it is not a
+ * live input to anything.
+ */
+export function legacyRosterPath(inputs: XdgInputs): string {
   return join(resolveConfigHome(inputs), "candlestix", "roster.yaml");
 }
 
@@ -77,17 +90,6 @@ export function registryPath(inputs: XdgInputs): string {
 
 export function healthSignalPath(inputs: XdgInputs): string {
   return join(candlestixRuntimeDir(inputs), "health.json");
-}
-
-/**
- * CONDEMNED, deliberately loudly named: the roster's agents have no id, so
- * the id-keyed `agentMcpConfigPath` below cannot serve this call site. This
- * function is confined to the roster-driven supervisor spawn path
- * (src/spawn.ts / src/supervisor.ts) and is retired by CNDLX-19 along with
- * the roster itself — do not add a second call site.
- */
-export function legacyRosterMcpConfigPath(inputs: XdgInputs, agentName: string): string {
-  return join(candlestixRuntimeDir(inputs), "agents", agentName, "mcp.json");
 }
 
 /**

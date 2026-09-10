@@ -9,7 +9,7 @@ describe("evaluateStaleness", () => {
   // reported as anything but healthy.
   test("a heartbeat well within the threshold is healthy", () => {
     const lastHeartbeat = new Date(NOW.getTime() - 1_000);
-    expect(evaluateStaleness({ tracked: true, lastHeartbeat }, NOW, THRESHOLD_MS)).toEqual({
+    expect(evaluateStaleness({ tracked: true, lastHeartbeat, displayName: undefined }, NOW, THRESHOLD_MS)).toEqual({
       kind: "healthy",
       lastHeartbeat,
     });
@@ -19,7 +19,7 @@ describe("evaluateStaleness", () => {
   // is ever reported healthy or unknown.
   test("a heartbeat older than the threshold is stale", () => {
     const lastHeartbeat = new Date(NOW.getTime() - THRESHOLD_MS - 1);
-    expect(evaluateStaleness({ tracked: true, lastHeartbeat }, NOW, THRESHOLD_MS)).toEqual({
+    expect(evaluateStaleness({ tracked: true, lastHeartbeat, displayName: undefined }, NOW, THRESHOLD_MS)).toEqual({
       kind: "stale",
       lastHeartbeat,
     });
@@ -29,7 +29,7 @@ describe("evaluateStaleness", () => {
   // Fails if "never started" is ever reported as healthy (or unknown —
   // this subject IS tracked).
   test("a tracked subject with no heartbeat ever recorded is stale, never healthy", () => {
-    expect(evaluateStaleness({ tracked: true, lastHeartbeat: null }, NOW, THRESHOLD_MS)).toEqual({
+    expect(evaluateStaleness({ tracked: true, lastHeartbeat: null, displayName: undefined }, NOW, THRESHOLD_MS)).toEqual({
       kind: "stale",
       lastHeartbeat: null,
     });
@@ -39,7 +39,7 @@ describe("evaluateStaleness", () => {
   // untracked lookup is ever reported as a definite stale or healthy
   // verdict.
   test("an untracked subject is unknown, never a definite stale or healthy verdict", () => {
-    const verdict = evaluateStaleness({ tracked: false, lastHeartbeat: null }, NOW, THRESHOLD_MS);
+    const verdict = evaluateStaleness({ tracked: false, lastHeartbeat: null, displayName: undefined }, NOW, THRESHOLD_MS);
     expect(verdict).toEqual({ kind: "unknown" });
     expect(verdict.kind).not.toBe("stale");
     expect(verdict.kind).not.toBe("healthy");
@@ -52,12 +52,12 @@ describe("evaluateStaleness", () => {
   describe("boundary at exactly the threshold", () => {
     test("age === thresholdMs is healthy (staleness requires exceeding the threshold)", () => {
       const lastHeartbeat = new Date(NOW.getTime() - THRESHOLD_MS);
-      expect(evaluateStaleness({ tracked: true, lastHeartbeat }, NOW, THRESHOLD_MS).kind).toBe("healthy");
+      expect(evaluateStaleness({ tracked: true, lastHeartbeat, displayName: undefined }, NOW, THRESHOLD_MS).kind).toBe("healthy");
     });
 
     test("age === thresholdMs + 1 is stale", () => {
       const lastHeartbeat = new Date(NOW.getTime() - THRESHOLD_MS - 1);
-      expect(evaluateStaleness({ tracked: true, lastHeartbeat }, NOW, THRESHOLD_MS).kind).toBe("stale");
+      expect(evaluateStaleness({ tracked: true, lastHeartbeat, displayName: undefined }, NOW, THRESHOLD_MS).kind).toBe("stale");
     });
   });
 });
