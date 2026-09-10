@@ -1,8 +1,8 @@
-// The spawn entry point for a DAEMON-CREATED agent (an `AgentRecord`), as
-// distinct from spawn.ts's `spawnBackgroundAgent` (a roster entry: required
-// `job`, required `cwd`, name-keyed MCP path). That existing function and
-// its roster shape are left untouched — CNDLX-19 retires both along with
-// the roster itself; this is a sibling, not a replacement.
+// The spawn entry point for a DAEMON-CREATED agent (an `AgentRecord`).
+// CNDLX-19 retired the roster entirely — the roster-shaped sibling this
+// module once stood beside, `spawn.ts`'s `spawnBackgroundAgent` (required
+// `job`, required `cwd`, name-keyed MCP path), no longer exists in this
+// tree. This is now the ONLY spawn path the supervisor calls.
 
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -31,11 +31,10 @@ export type SpawnDaemonAgentResult = { ok: true } | { ok: false; error: string }
 /**
  * R11: `job` is OPTIONAL on an `AgentRecord`. Where absent, the
  * `--append-system-prompt` flag is OMITTED from argv entirely — never
- * passed an empty string. This is the live fix R11 asks for on THIS spawn
- * path; spawn.ts's roster-driven `spawnBackgroundAgent` is left passing it
- * unconditionally, which is correct there (a roster entry's `job` is
- * required, not optional) and is retired with the roster by CNDLX-19, not
- * fixed here.
+ * passed an empty string. (The pre-CNDLX-19 roster's own spawn path,
+ * `spawn.ts`'s `spawnBackgroundAgent`, passed it unconditionally, which
+ * was correct there since a roster entry's `job` was required, not
+ * optional — that module no longer exists, retired with the roster.)
  *
  * S6: writes an empty MCP config at the ID-KEYED path the caller supplies
  * (see `paths.ts`'s `agentMcpConfigPath`, R16) and keeps
@@ -43,14 +42,13 @@ export type SpawnDaemonAgentResult = { ok: true } | { ok: false; error: string }
  * exactly the MCP servers candlestix configured, nothing ambient) is
  * preserved even though this ticket configures none.
  *
- * Everything else mirrors spawn.ts's own reasoning verbatim: `claude --bg`
- * needs no TTY and skips the trust dialog; every launch is wrapped in its
- * own `systemd-run --user --scope` to keep this invocation (and, if it is
- * the very first `claude --bg` on this Unix user, the shared `claude
- * daemon run` singleton it gives birth to) out of candlestix.service's own
- * cgroup (R7); `--expand-environment=no` is pinned so a future systemd
- * default change cannot start expanding `$`-looking text in a job
- * description.
+ * `claude --bg` needs no TTY and skips the trust dialog; every launch is
+ * wrapped in its own `systemd-run --user --scope` to keep this invocation
+ * (and, if it is the very first `claude --bg` on this Unix user, the
+ * shared `claude daemon run` singleton it gives birth to) out of
+ * candlestix.service's own cgroup (R7); `--expand-environment=no` is
+ * pinned so a future systemd default change cannot start expanding
+ * `$`-looking text in a job description.
  */
 export async function spawnDaemonAgent(
   agent: Pick<AgentRecord, "id" | "job">,

@@ -29,10 +29,11 @@ export interface AgentRecord {
   createdAt: string;
 }
 
-// Precedent: the existing roster name pattern is `/^[a-z0-9][a-z0-9._-]*$/`
-// (lowercase letters, digits, ".", "_", "-", starting with a letter or
-// digit; see src/roster.ts). Reused verbatim for the character set, with
-// two additions that are this ticket's own call:
+// Precedent: the pre-CNDLX-19 roster name pattern was
+// `/^[a-z0-9][a-z0-9._-]*$/` (lowercase letters, digits, ".", "_", "-",
+// starting with a letter or digit; that module, src/roster.ts, no longer
+// exists — retired with the roster). Reused verbatim for the character
+// set, with two additions that are this ticket's own call:
 //   - a length bound (1-63 chars): unbounded names are an easy accidental
 //     footgun (a pasted paragraph becomes "the name") and 63 mirrors the
 //     common hostname/label length limit operators are already used to.

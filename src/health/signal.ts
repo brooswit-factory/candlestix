@@ -16,6 +16,14 @@ import { evaluateStaleness, type StalenessVerdict } from "./staleness";
 
 export interface HealthSignalVerdict {
   subjectId: string;
+  /**
+   * CNDLX-19 T4: `subjectId` is now the agent's durable id, not a mutable
+   * name (see heartbeat.ts) — an id-only signal an operator cannot map
+   * back to an agent would be a legibility regression, so the display name
+   * the store carries for this subject, if any, rides along here. Never
+   * used for matching — display only.
+   */
+  agentName: string | undefined;
   verdict: StalenessVerdict["kind"];
   /** ISO 8601, or null if never observed / no heartbeat recorded yet. */
   lastHeartbeat: string | null;
@@ -57,9 +65,11 @@ export function buildHealthSnapshot(
   thresholdMs: number
 ): HealthSignalSnapshot {
   const subjects: HealthSignalVerdict[] = store.listTrackedSubjects().map((subjectId) => {
-    const verdict = evaluateStaleness(store.getHeartbeat(subjectId), now, thresholdMs);
+    const lookup = store.getHeartbeat(subjectId);
+    const verdict = evaluateStaleness(lookup, now, thresholdMs);
     return {
       subjectId,
+      agentName: lookup.displayName,
       verdict: verdict.kind,
       lastHeartbeat: verdict.kind === "unknown" ? null : verdict.lastHeartbeat?.toISOString() ?? null,
     };
