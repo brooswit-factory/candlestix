@@ -1,20 +1,19 @@
 import { log } from "./log";
-import { loadRoster } from "./roster-source";
 import { runReconcileCycle } from "./supervisor";
 import { runCommand } from "./exec";
 import { createHeartbeatStore } from "./health/heartbeat";
 import { startStalenessAlarm } from "./health/alarm";
 import { startHealthSignalWriter } from "./health/signal";
-import { rosterPath, registryPath, healthSignalPath, legacyRosterMcpConfigPath } from "./paths";
+import { pathExists } from "./registry-store";
+import { agentSetPath, agentsBaseDir, agentDirectoryPath, agentMcpConfigPath, registryPath, healthSignalPath, legacyRosterPath } from "./paths";
 
-// This is candlestix's real cycle cadence, produced by this story (the
-// ticket names this as a "first" — staleness.ts's DEFAULT_STALENESS_THRESHOLD_MS
-// was a placeholder pending exactly this). RECONCILE_INTERVAL_MS is chosen,
-// not measured: `claude agents --json` plus a handful of `stat`/`kill(pid,0)`
-// calls per roster entry is cheap, so 20s is "responsive to a killed agent
-// within tens of seconds" without polling aggressively for a product whose
-// whole roster is expected to be a handful of very-long-lived agents, not
-// hundreds.
+// This is candlestix's real cycle cadence (staleness.ts's
+// DEFAULT_STALENESS_THRESHOLD_MS was a placeholder pending exactly this).
+// RECONCILE_INTERVAL_MS is chosen, not measured: `claude agents --json`
+// plus a handful of `stat`/`kill(pid,0)` calls per agent is cheap, so 20s
+// is "responsive to a killed agent within tens of seconds" without polling
+// aggressively for a product whose whole agent set is expected to be a
+// handful of very-long-lived agents, not hundreds.
 const RECONCILE_INTERVAL_MS = 20_000;
 
 // Deliberately NOT importing DEFAULT_STALENESS_THRESHOLD_MS (90s): that
@@ -29,14 +28,39 @@ const STALENESS_THRESHOLD_MS = RECONCILE_INTERVAL_MS * 3;
 const HEALTH_SIGNAL_INTERVAL_MS = RECONCILE_INTERVAL_MS;
 const ALARM_INTERVAL_MS = RECONCILE_INTERVAL_MS;
 
+/**
+ * CNDLX-19 / R12: the roster is retired — no code path reads it any more
+ * (see supervisor.ts, which now reads only the durable agent set). If a
+ * legacy roster file still exists on disk, an operator may believe it is
+ * still authoritative; silently ignoring it would hide that belief is now
+ * wrong, and silently migrating it would create agents nobody asked for.
+ * So: check ONCE, at startup — never once per cycle, which would be noise
+ * — and if the file exists, say so loudly, naming its full path, that it
+ * is no longer read, and what to do instead.
+ */
+async function warnIfLegacyRosterExists(): Promise<void> {
+  const path = legacyRosterPath();
+  if (await pathExists(path)) {
+    log(
+      "warn",
+      `legacy roster file found at "${path}" — it is NO LONGER READ. Agents are now created and managed entirely through candlestix's own daemon-owned agent set (create/on/off/rename/archive/unarchive/delete — see agent-actions.ts; no CLI or API surface exists yet, see CNDLX-15). This file will never be consulted again; delete it or leave it in place, either is safe, but editing it will have no effect.`
+    );
+  }
+}
+
 async function main(): Promise<void> {
   log("info", "candlestix starting");
 
+  await warnIfLegacyRosterExists();
+
   const heartbeatStore = createHeartbeatStore();
-  const resolvedRosterPath = rosterPath();
+  const unexpectedSessionWarnings = new Map<string, string>();
+  const resolvedAgentSetPath = agentSetPath();
+  const resolvedAgentsBaseDir = agentsBaseDir();
   const resolvedRegistryPath = registryPath();
   const resolvedHealthSignalPath = healthSignalPath();
-  log("info", `roster path: ${resolvedRosterPath}`);
+  log("info", `agent set path: ${resolvedAgentSetPath}`);
+  log("info", `agents directory: ${resolvedAgentsBaseDir}`);
   log("info", `registry path: ${resolvedRegistryPath}`);
   log("info", `health signal path: ${resolvedHealthSignalPath}`);
 
@@ -49,16 +73,14 @@ async function main(): Promise<void> {
     }
     cycleInFlight = true;
     try {
-      const rosterResult = await loadRoster(resolvedRosterPath);
-      if (!rosterResult.ok) {
-        log("error", `roster could not be loaded, no agents reconciled this cycle: ${rosterResult.errors.join("; ")}`);
-        return;
-      }
-      await runReconcileCycle(rosterResult.roster, {
+      await runReconcileCycle({
+        agentSetPath: resolvedAgentSetPath,
+        agentDirectoryPath,
+        agentMcpConfigPath,
         registryPath: resolvedRegistryPath,
-        legacyRosterMcpConfigPath,
         runCommand,
         heartbeatStore,
+        unexpectedSessionWarnings,
       });
     } catch (err) {
       log("error", `reconcile cycle threw and was caught; the next scheduled tick still runs: ${String(err)}`);
@@ -98,12 +120,10 @@ async function main(): Promise<void> {
     // or adopted is a `claude --bg` background session — a process tree
     // that is a child of Claude Code's own persistent background-session
     // daemon, not of this process, and living in its own systemd scope
-    // (see spawn.ts), not this service's cgroup. Their defined fate on
-    // shutdown, restart, or crash of candlestix is: left running,
-    // untouched, exactly where they are. That is what makes re-adoption on
-    // the next startup possible at all — see supervisor.ts / reconcile.ts
-    // and the README's "Restart survival" section for how the next
-    // startup finds them again.
+    // (see agent-spawn.ts), not this service's cgroup. Their defined fate
+    // on shutdown, restart, or crash of candlestix is: left running,
+    // untouched, exactly where they are — see the README's "Restart
+    // survival" section for how the next startup finds them again.
     clearInterval(reconcileTimer);
     alarm.stop();
     signal.stop();

@@ -3,10 +3,9 @@ import {
   resolveConfigHome,
   resolveRuntimeDir,
   resolveStateHome,
-  rosterPath,
+  legacyRosterPath,
   registryPath,
   healthSignalPath,
-  legacyRosterMcpConfigPath,
   agentMcpConfigPath,
   candlestixStateDir,
   agentSetPath,
@@ -61,20 +60,15 @@ describe("resolveRuntimeDir", () => {
 });
 
 describe("derived paths", () => {
-  test("rosterPath", () => {
-    expect(rosterPath(base)).toBe("/home/operator/.config/candlestix/roster.yaml");
-    expect(rosterPath({ ...base, configHome: "/xdg/config" })).toBe("/xdg/config/candlestix/roster.yaml");
+  test("legacyRosterPath — CNDLX-19/R12: no longer read by anything, kept only so the startup warning can name its full path", () => {
+    expect(legacyRosterPath(base)).toBe("/home/operator/.config/candlestix/roster.yaml");
+    expect(legacyRosterPath({ ...base, configHome: "/xdg/config" })).toBe("/xdg/config/candlestix/roster.yaml");
   });
 
-  test("registryPath and healthSignalPath live under the runtime dir, not config or a roster cwd", () => {
+  test("registryPath and healthSignalPath live under the runtime dir, not config or an agent's own directory", () => {
     const inputs = { ...base, runtimeDir: "/run/user/1000" };
     expect(registryPath(inputs)).toBe("/run/user/1000/candlestix/registry.json");
     expect(healthSignalPath(inputs)).toBe("/run/user/1000/candlestix/health.json");
-  });
-
-  test("legacyRosterMcpConfigPath is scoped per agent NAME, under the runtime dir — condemned, roster-only (R16)", () => {
-    const inputs = { ...base, runtimeDir: "/run/user/1000" };
-    expect(legacyRosterMcpConfigPath(inputs, "release-notes")).toBe("/run/user/1000/candlestix/agents/release-notes/mcp.json");
   });
 
   test("agentMcpConfigPath (R16) is scoped per agent ID, under the runtime dir — the live, honest path", () => {

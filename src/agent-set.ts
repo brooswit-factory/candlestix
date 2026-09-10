@@ -2,8 +2,10 @@
 // the invariant-enforcing mutators that a "create"/"rename"/"delete"
 // action (sibling tickets, out of scope here) will call. No fs, no clock,
 // no process, no network — mirrors the parse discipline of
-// src/registry.ts and src/roster.ts (never throws, discriminated union,
-// explicit version check, error strings that name the offending entry).
+// src/registry.ts (never throws, discriminated union, explicit version
+// check, error strings that name the offending entry) — a discipline this
+// module and src/registry.ts share by design, inherited in turn from the
+// pre-CNDLX-19 roster parser that first established it in this tree.
 //
 // What is deliberately NOT here: the lifecycle verbs themselves
 // (create/on/off/rename/archive/unarchive/delete/list). `insertAgent`,

@@ -3,38 +3,44 @@ import { decideReconcileAction, type ReconcileInputs } from "../../src/reconcile
 import type { BackgroundAgentInfo } from "../../src/agents-cli";
 import type { RegistryEntry } from "../../src/registry";
 
+const AGENT_ID = "@01m24dm7tbg3wxc8j9x0";
+const AGENT_DIR = "/home/operator/.local/state/candlestix/agents/@01m24dm7tbg3wxc8j9x0";
+
 const baseInputs: ReconcileInputs = {
+  agentId: AGENT_ID,
   agentName: "release-notes",
-  agentCwd: "/home/operator/code/candlestix",
+  state: "on",
+  agentDir: AGENT_DIR,
   registryEntry: undefined,
   backgroundAgents: [],
   verifiedAlivePids: new Set(),
-  cwdExists: true,
+  dirExists: true,
 };
 
 const bgAgent: BackgroundAgentInfo = {
   id: "179b2dfc",
   sessionId: "179b2dfc-7069-4a4f-bfb4-bcbea162d77e",
-  cwd: "/home/operator/code/candlestix",
+  cwd: AGENT_DIR,
   startedAt: 1000,
   pid: 42,
 };
 
 const registryEntry: RegistryEntry = {
-  name: "release-notes",
-  id: bgAgent.id,
+  agentId: AGENT_ID,
+  agentName: "release-notes",
+  sessionShortId: bgAgent.id,
   sessionId: bgAgent.sessionId,
   cwd: bgAgent.cwd,
   spawnedAt: "2026-09-02T00:00:00.000Z",
 };
 
-describe("decideReconcileAction — the false-healthy paths this ticket says to hunt for", () => {
-  test("no registry entry, no matching background agent, cwd exists -> spawn", () => {
+describe("decideReconcileAction — state === \"on\" (unchanged spawn/wait/heartbeat behaviour, re-keyed to id/directory)", () => {
+  test("no registry entry, no matching background agent, dir exists -> spawn", () => {
     expect(decideReconcileAction(baseInputs)).toEqual({ type: "spawn" });
   });
 
-  test("no registry entry, no matching background agent, cwd missing -> cwd-missing, never spawn", () => {
-    expect(decideReconcileAction({ ...baseInputs, cwdExists: false })).toEqual({ type: "cwd-missing" });
+  test("no registry entry, no matching background agent, dir missing -> dir-missing, never spawn", () => {
+    expect(decideReconcileAction({ ...baseInputs, dirExists: false })).toEqual({ type: "dir-missing" });
   });
 
   test("registry entry matches a listed agent whose pid independently verifies alive -> heartbeat", () => {
@@ -46,11 +52,32 @@ describe("decideReconcileAction — the false-healthy paths this ticket says to 
     });
     expect(action).toEqual({
       type: "heartbeat",
-      entry: { name: "release-notes", id: bgAgent.id, sessionId: bgAgent.sessionId, cwd: bgAgent.cwd, spawnedAt: registryEntry.spawnedAt },
+      entry: {
+        agentId: AGENT_ID,
+        agentName: "release-notes",
+        sessionShortId: bgAgent.id,
+        sessionId: bgAgent.sessionId,
+        cwd: bgAgent.cwd,
+        spawnedAt: registryEntry.spawnedAt,
+      },
     });
   });
 
-  test("listed but claude reported no pid this cycle -> wait, NEVER heartbeat — the exact transient false-healthy trap this was built to catch", () => {
+  test("a nameless (blank) agent's heartbeat entry omits agentName entirely", () => {
+    const action = decideReconcileAction({
+      ...baseInputs,
+      agentName: undefined,
+      registryEntry: undefined,
+      backgroundAgents: [bgAgent],
+      verifiedAlivePids: new Set([42]),
+    });
+    expect(action.type).toBe("heartbeat");
+    if (action.type === "heartbeat") {
+      expect(action.entry.agentName).toBeUndefined();
+    }
+  });
+
+  test("listed but claude reported no pid this cycle -> wait, NEVER heartbeat", () => {
     const withoutPid: BackgroundAgentInfo = { ...bgAgent, pid: undefined };
     const action = decideReconcileAction({
       ...baseInputs,
@@ -71,8 +98,8 @@ describe("decideReconcileAction — the false-healthy paths this ticket says to 
     expect(action.type).toBe("wait");
   });
 
-  test("registry points at a session no longer listed, but cwd-adoption finds a different live one -> heartbeat (registry self-heals), with the NEW session's own spawnedAt — never the dead predecessor's", () => {
-    const staleRegistryEntry: RegistryEntry = { ...registryEntry, id: "dead-id", sessionId: "dead-session" };
+  test("registry points at a session no longer listed, but directory-adoption finds a different live one -> heartbeat (registry self-heals), with the NEW session's own spawnedAt", () => {
+    const staleRegistryEntry: RegistryEntry = { ...registryEntry, sessionShortId: "dead-id", sessionId: "dead-session" };
     const action = decideReconcileAction({
       ...baseInputs,
       registryEntry: staleRegistryEntry,
@@ -82,8 +109,9 @@ describe("decideReconcileAction — the false-healthy paths this ticket says to 
     expect(action).toEqual({
       type: "heartbeat",
       entry: {
-        name: "release-notes",
-        id: bgAgent.id,
+        agentId: AGENT_ID,
+        agentName: "release-notes",
+        sessionShortId: bgAgent.id,
         sessionId: bgAgent.sessionId,
         cwd: bgAgent.cwd,
         spawnedAt: new Date(bgAgent.startedAt).toISOString(), // NOT staleRegistryEntry.spawnedAt — different session
@@ -91,24 +119,7 @@ describe("decideReconcileAction — the false-healthy paths this ticket says to 
     });
   });
 
-  test("a fresh spawn that replaced a genuinely-ended session gets its OWN spawnedAt, not the dead predecessor's, even though a registry entry for the name still exists", () => {
-    const deadPredecessor: RegistryEntry = { ...registryEntry, sessionId: "a-session-that-ended-long-ago", spawnedAt: "2020-01-01T00:00:00.000Z" };
-    const freshSession: BackgroundAgentInfo = { ...bgAgent, sessionId: "brand-new-session", startedAt: 5000, pid: 99 };
-    const action = decideReconcileAction({
-      ...baseInputs,
-      registryEntry: deadPredecessor,
-      backgroundAgents: [freshSession],
-      verifiedAlivePids: new Set([99]),
-    });
-    expect(action.type).toBe("heartbeat");
-    if (action.type === "heartbeat") {
-      expect(action.entry.sessionId).toBe("brand-new-session");
-      expect(action.entry.spawnedAt).toBe(new Date(5000).toISOString());
-      expect(action.entry.spawnedAt).not.toBe(deadPredecessor.spawnedAt);
-    }
-  });
-
-  test("no registry entry at all, but a live session already exists at this cwd -> adopt it, never spawn a duplicate", () => {
+  test("no registry entry at all, but a live session already exists under this agent's directory -> adopt it, never spawn a duplicate", () => {
     const action = decideReconcileAction({
       ...baseInputs,
       registryEntry: undefined,
@@ -118,37 +129,134 @@ describe("decideReconcileAction — the false-healthy paths this ticket says to 
     expect(action.type).toBe("heartbeat");
   });
 
-  test("registry entry present but genuinely gone (not listed, no cwd match either) and cwd still exists -> spawn a replacement", () => {
+  test("registry entry present but genuinely gone (not listed, no directory match either) and dir still exists -> spawn a replacement", () => {
     const action = decideReconcileAction({
       ...baseInputs,
       registryEntry,
       backgroundAgents: [],
       verifiedAlivePids: new Set(),
-      cwdExists: true,
+      dirExists: true,
     });
     expect(action).toEqual({ type: "spawn" });
   });
 
-  test("registry entry present but genuinely gone and cwd missing -> cwd-missing, never spawn into a dead directory", () => {
+  test("registry entry present but genuinely gone and dir missing -> dir-missing, never spawn into a dead directory", () => {
     const action = decideReconcileAction({
       ...baseInputs,
       registryEntry,
       backgroundAgents: [],
       verifiedAlivePids: new Set(),
-      cwdExists: false,
+      dirExists: false,
     });
-    expect(action).toEqual({ type: "cwd-missing" });
+    expect(action).toEqual({ type: "dir-missing" });
   });
 
-  test("a background agent for a DIFFERENT cwd never gets adopted for this one", () => {
+  test("a background agent under a DIFFERENT directory never gets adopted for this one", () => {
     const elsewhere: BackgroundAgentInfo = { ...bgAgent, cwd: "/somewhere/else" };
     const action = decideReconcileAction({
       ...baseInputs,
       registryEntry: undefined,
       backgroundAgents: [elsewhere],
       verifiedAlivePids: new Set([42]),
-      cwdExists: true,
+      dirExists: true,
     });
     expect(action).toEqual({ type: "spawn" });
+  });
+
+  test("T5: more than one live session matches this agent's directory exactly and none matches the registry -> wait, never adopt ambiguously, never spawn a duplicate", () => {
+    const second: BackgroundAgentInfo = { ...bgAgent, id: "another", sessionId: "another-session", pid: 43 };
+    const action = decideReconcileAction({
+      ...baseInputs,
+      registryEntry: undefined,
+      backgroundAgents: [bgAgent, second],
+      verifiedAlivePids: new Set([42, 43]),
+      dirExists: true,
+    });
+    expect(action.type).toBe("wait");
+    if (action.type === "wait") {
+      expect(action.reason).toContain("179b2dfc");
+      expect(action.reason).toContain("another");
+    }
+  });
+
+  test("an identity match still wins over an ambiguous directory match — registry breaks the tie", () => {
+    const second: BackgroundAgentInfo = { ...bgAgent, id: "another", sessionId: "another-session", pid: 43 };
+    const action = decideReconcileAction({
+      ...baseInputs,
+      registryEntry, // matches bgAgent by sessionId
+      backgroundAgents: [bgAgent, second],
+      verifiedAlivePids: new Set([42, 43]),
+      dirExists: true,
+    });
+    expect(action.type).toBe("heartbeat");
+  });
+});
+
+describe("decideReconcileAction — CNDLX-19 T1: state !== \"on\" is NEVER spawned, by any path", () => {
+  for (const state of ["off", "archived"] as const) {
+    test(`state "${state}", no live session under the directory -> not-subject (quiet, nothing to do), never spawn`, () => {
+      const action = decideReconcileAction({ ...baseInputs, state, registryEntry: undefined, backgroundAgents: [], dirExists: true });
+      expect(action).toEqual({ type: "not-subject" });
+    });
+
+    test(`state "${state}", no live session, dir does not even exist -> STILL not-subject, never dir-missing, never spawn`, () => {
+      // Directory existence is only ever consulted on the "on" spawn path
+      // — an off/archived agent's directory not existing is not this
+      // function's problem to report.
+      const action = decideReconcileAction({ ...baseInputs, state, registryEntry: undefined, backgroundAgents: [], dirExists: false });
+      expect(action).toEqual({ type: "not-subject" });
+    });
+
+    test(`CNDLX-19 T2: state "${state}" WITH a live session under its directory anyway -> unexpected-session, reports only, never spawns and (by construction — no such action type exists) never stops anything`, () => {
+      const action = decideReconcileAction({ ...baseInputs, state, registryEntry: undefined, backgroundAgents: [bgAgent], verifiedAlivePids: new Set([42]) });
+      expect(action.type).toBe("unexpected-session");
+      if (action.type === "unexpected-session") {
+        expect(action.sessionIds).toEqual([bgAgent.id]);
+        expect(action.reason).toContain(state);
+      }
+    });
+
+    test(`state "${state}" reports EVERY live session under the directory, not just the first, when more than one exists`, () => {
+      const second: BackgroundAgentInfo = { ...bgAgent, id: "second-session", sessionId: "second-session-full" };
+      const action = decideReconcileAction({
+        ...baseInputs,
+        state,
+        registryEntry: undefined,
+        backgroundAgents: [bgAgent, second],
+        verifiedAlivePids: new Set([42]),
+      });
+      expect(action.type).toBe("unexpected-session");
+      if (action.type === "unexpected-session") {
+        expect(action.sessionIds.sort()).toEqual([bgAgent.id, second.id].sort());
+      }
+    });
+
+    test(`state "${state}" ignores a registry entry entirely — a stale registry pointing elsewhere changes nothing about the verdict`, () => {
+      const action = decideReconcileAction({ ...baseInputs, state, registryEntry, backgroundAgents: [], dirExists: true });
+      expect(action).toEqual({ type: "not-subject" });
+    });
+
+    test(`state "${state}" never reaches "spawn" even when the directory exists and nothing else is listed — the exact pre-CNDLX-19 bug this ticket fixes`, () => {
+      const action = decideReconcileAction({ ...baseInputs, state, registryEntry: undefined, backgroundAgents: [], dirExists: true });
+      expect(action.type).not.toBe("spawn");
+    });
+  }
+});
+
+describe("CNDLX-19 T7 (H3): the loop obeys the recorded state exactly, with no heuristic override", () => {
+  test("state says \"on\" but nothing is listed at all — the loop spawns, it does not infer the record is wrong and refuse", () => {
+    const action = decideReconcileAction({ ...baseInputs, state: "on", registryEntry: undefined, backgroundAgents: [], dirExists: true });
+    expect(action).toEqual({ type: "spawn" });
+  });
+
+  test("state says \"off\" but a session is genuinely alive — the loop does not infer the record is stale and touch the session; it only reports", () => {
+    const action = decideReconcileAction({
+      ...baseInputs,
+      state: "off",
+      registryEntry: undefined,
+      backgroundAgents: [bgAgent],
+      verifiedAlivePids: new Set([42]),
+    });
+    expect(action.type).toBe("unexpected-session");
   });
 });

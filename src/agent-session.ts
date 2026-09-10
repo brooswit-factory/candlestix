@@ -1,10 +1,15 @@
 // S2 + R7 + S3: find the live `claude --bg` session(s) backing a
-// daemon-managed agent by its DIRECTORY, never by a registry keyed by
-// name (the existing session registry — src/registry.ts — is itself
-// name-keyed and is the roster/reconcile path's business, not ours: see
-// this ticket's R16 finding #2). And stop/remove exactly the session(s)
-// found, using the per-session verbs `claude` itself provides
-// (`stop`/`rm`) — never a cgroup, a scope, or `systemctl` (R7).
+// daemon-managed agent by its DIRECTORY, never by the session registry
+// (src/registry.ts) — that registry is the reconcile loop's own
+// bookkeeping, not ours, and this module intentionally does not depend on
+// it (R16 finding #2: at the time this module was written, that registry
+// was still name-keyed; CNDLX-19 has since re-keyed it to the agent's
+// durable id, but the reason to stay independent of it here is unchanged
+// — this is the ground-truth lookup CNDLX-19's own reconcile loop is
+// instructed to prefer over trusting its registry alone). And stop/remove
+// exactly the session(s) found, using the per-session verbs `claude`
+// itself provides (`stop`/`rm`) — never a cgroup, a scope, or `systemctl`
+// (R7).
 
 import { parseAgentsJson, type BackgroundAgentInfo, type RunCommand } from "./agents-cli";
 
