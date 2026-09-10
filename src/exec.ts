@@ -1,9 +1,9 @@
 // Thin child-process runner shared by agents-cli.ts (listing) and
-// spawn.ts (launching). Argv-array based throughout candlestix — never a
-// shell string — so an operator's job description or any other
-// roster-derived value can contain arbitrary text (quotes, `$`, backticks,
-// newlines) without any escaping concern: it is handed to execve as one
-// argv element, never interpreted by a shell.
+// agent-spawn.ts (launching). Argv-array based throughout candlestix —
+// never a shell string — so a job description or any other operator- or
+// daemon-supplied value can contain arbitrary text (quotes, `$`,
+// backticks, newlines) without any escaping concern: it is handed to
+// execve as one argv element, never interpreted by a shell.
 export interface CommandResult {
   exitCode: number;
   stdout: string;
