@@ -32,6 +32,8 @@ export function currentXdgInputs(): xdg.XdgInputs {
 export const legacyRosterPath = (): string => xdg.legacyRosterPath(currentXdgInputs());
 export const registryPath = (): string => xdg.registryPath(currentXdgInputs());
 export const healthSignalPath = (): string => xdg.healthSignalPath(currentXdgInputs());
+/** CNDLX-27/CNDLX-32: the ONE path the daemon and any client (the CLI) both resolve the API socket from. */
+export const apiSocketPath = (): string => xdg.apiSocketPath(currentXdgInputs());
 /** R16: id-keyed, id-validated. */
 export const agentMcpConfigPath = (agentId: string): string => xdg.agentMcpConfigPath(currentXdgInputs(), agentId);
 export const agentSetPath = (): string => xdg.agentSetPath(currentXdgInputs());

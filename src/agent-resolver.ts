@@ -8,7 +8,7 @@ import { findAgentByName, type AgentSet } from "./agent-set";
 import type { AgentRecord } from "./agent";
 
 export type ResolveAgentError =
-  | { kind: "not-found"; query: string }
+  | { kind: "not-found"; query: string; message: string }
   /**
    * Kept defensively even though it is structurally unreachable through
    * this module's own sanctioned entry points: `parseAgentSet` rejects a
@@ -22,7 +22,7 @@ export type ResolveAgentError =
    * some future codepath this ticket cannot see) — such a caller still
    * gets a typed answer instead of an arbitrary "first match wins".
    */
-  | { kind: "ambiguous"; query: string; matches: AgentRecord[] };
+  | { kind: "ambiguous"; query: string; matches: AgentRecord[]; message: string };
 
 export type ResolveAgentResult = { ok: true; agent: AgentRecord } | { ok: false; error: ResolveAgentError };
 
@@ -39,7 +39,7 @@ export function resolveAgent(agentSet: AgentSet, query: string): ResolveAgentRes
     if (byId !== undefined) {
       return { ok: true, agent: byId };
     }
-    return { ok: false, error: { kind: "not-found", query } };
+    return { ok: false, error: { kind: "not-found", query, message: `no agent found with id "${query}"` } };
   }
 
   const matches = Object.values(agentSet.agents).filter((agent) => agent.name === query);
@@ -47,9 +47,17 @@ export function resolveAgent(agentSet: AgentSet, query: string): ResolveAgentRes
     return { ok: true, agent: matches[0] as AgentRecord };
   }
   if (matches.length === 0) {
-    return { ok: false, error: { kind: "not-found", query } };
+    return { ok: false, error: { kind: "not-found", query, message: `no agent found named "${query}"` } };
   }
-  return { ok: false, error: { kind: "ambiguous", query, matches } };
+  return {
+    ok: false,
+    error: {
+      kind: "ambiguous",
+      query,
+      matches,
+      message: `"${query}" matches more than one agent (${matches.length}): ${matches.map((m) => m.id).join(", ")} — this should be structurally impossible under R1/R2 (disjoint ids/names, unique names); use the exact id to disambiguate`,
+    },
+  };
 }
 
 // Re-exported so a caller that only needs "does a name exist" doesn't have
