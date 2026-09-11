@@ -24,7 +24,12 @@ import { validateAgentNameSyntax, type NameValidationError } from "./agent";
 // breaks nothing," so the cheap, reversible direction is the superset. This
 // list is `create, attach, on, off, rename, name, archive, unarchive,
 // delete, list` (the epic's five words plus `create`, `attach`, `unarchive`
-// and `list` — the actions this ticket adds or that CNDLX-3 owns).
+// and `list` — the actions this ticket adds or that CNDLX-3 owns), plus
+// `open-terminal` (CNDLX-32/CNDLX-27): R17's standing rule is "whoever names
+// a new verb reserves that word at the same moment" — reserving it now,
+// while nothing can yet hold the name (no create/CLI surface existed until
+// this same PR), is free; reserving it later would be a breaking change for
+// whatever agent already held it.
 export const RESERVED_AGENT_NAMES: ReadonlySet<string> = new Set([
   "create",
   "attach",
@@ -36,6 +41,7 @@ export const RESERVED_AGENT_NAMES: ReadonlySet<string> = new Set([
   "unarchive",
   "delete",
   "list",
+  "open-terminal",
 ]);
 
 export type NameAllowedError =

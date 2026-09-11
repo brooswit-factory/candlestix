@@ -39,12 +39,22 @@ describe("resolveAgent", () => {
   test("typed not-found for an id-shaped query that matches no agent", () => {
     const missingId = id(999);
     const result = resolveAgent(emptyAgentSet(), missingId);
-    expect(result).toEqual({ ok: false, error: { kind: "not-found", query: missingId } });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("not-found");
+    if (result.error.kind !== "not-found") return;
+    expect(result.error.query).toBe(missingId);
+    expect(result.error.message).toContain(missingId);
   });
 
   test("typed not-found for a name-shaped query that matches no agent", () => {
     const result = resolveAgent(emptyAgentSet(), "nobody");
-    expect(result).toEqual({ ok: false, error: { kind: "not-found", query: "nobody" } });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("not-found");
+    if (result.error.kind !== "not-found") return;
+    expect(result.error.query).toBe("nobody");
+    expect(result.error.message).toContain("nobody");
   });
 
   test("an unnamed agent is reachable only by id, not by any name query", () => {
@@ -71,5 +81,6 @@ describe("resolveAgent", () => {
     if (result.error.kind !== "ambiguous") return;
     expect(result.error.matches).toHaveLength(2);
     expect(result.error.matches).toEqual(expect.arrayContaining([a, b]));
+    expect(result.error.message).toContain("shared");
   });
 });
