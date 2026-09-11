@@ -19,6 +19,28 @@ no "Done." That is the whole reason it is a separate product from `butchr`
 
 ## Status
 
+**CNDLX-33 landed: three defects CNDLX-27's own epic review found in the
+daemon API are fixed.** A malformed percent-escape in `{idOrName}`, and
+any other unexpected throw on the request path, now return typed JSON
+(`malformed-path` 400, `internal-error` 500) — never `Bun.serve`'s default
+HTML page (previously true of both). `POST /v1/agents` and `.../rename`
+now reject any body that isn't empty-or-an-object-with-only-the-expected-
+keys, so a bare string/number/array/`null`, or a typo'd field name, can no
+longer mint an agent and spawn a session (`invalid-request-body`, naming
+what was wrong). An empty or whitespace-only `job` is refused
+(`invalid-job`) rather than reaching spawn as `--append-system-prompt ""`
+(R3). See "The daemon API" and "Demonstrations — CNDLX-33" below.
+
+**CNDLX-32 landed: the daemon exposes the whole action set over a local
+Unix socket.** The eight-verb lifecycle action set, `attach-target` (R18's
+query), and the `open-terminal` seam are all reachable over HTTP-over-a-
+Unix-domain-socket — see "The daemon API" below for the transport
+reasoning, the route table, and the demonstration. The `candlestix` CLI
+(CNDLX-28/CNDLX-31) is a real, working thin client of this exact
+contract now — see "The candlestix CLI" below; the webapp (CNDLX-16)
+comes after. `open-terminal` itself is still an honest seam — CNDLX-3
+implements actually opening a window.
+
 **CNDLX-19 landed: the reconcile loop is desired-state driven, and the
 roster is retired.** candlestix now reads only the durable, daemon-owned
 agent set (`$XDG_STATE_HOME/candlestix/agents.json` — see "The durable
@@ -30,22 +52,22 @@ name-keyed per-agent MCP config) are deleted, not merely unused; see
 "Legacy roster file (retired)".
 
 The full eight-verb lifecycle action set (`create`/`on`/`off`/`rename`/
-`archive`/`unarchive`/`delete`/`list`, `src/agent-actions.ts`) now has a
-consumer: the reconcile loop reads exactly the state these verbs write.
+`archive`/`unarchive`/`delete`/`list`, `src/agent-actions.ts`) has two
+consumers: the reconcile loop reads exactly the state these verbs write,
+and the daemon API (`src/api/`) is the one process that calls them to
+mutate it.
 
-**CNDLX-30 (this story's task) added the `candlestix` CLI** — grammar, a
+**CNDLX-31 lands: the `candlestix` CLI now speaks the real, merged daemon
+API contract.** CNDLX-30 (a predecessor task) added the CLI — grammar, a
 thin HTTP-over-Unix-socket client, in-place attach, a confirming delete,
-exit codes, README and runbook. See "The candlestix CLI" below for what it
-is and, just as importantly, what it is **not yet**: it is built against a
-**temporary, local restatement** of CNDLX-27's daemon API contract
-(`src/api-contract.ts`), because CNDLX-27 (the daemon API itself — the
-socket, the routes, the real wire types) is being built in parallel and has
-not merged. **There is still no real daemon API in this tree, no HTTP
-server, and no socket anyone is listening on** — the CLI's own test suite
-talks only to a fake server on a temp Unix socket it starts itself. The
-real end-to-end demonstration against a real daemon and a real `claude --bg`
-session is CNDLX-31's job, after CNDLX-27 merges and this CLI rebases onto
-its real contract module. No webapp yet (CNDLX-16); the daemon-opens-a-window
+exit codes — built against a temporary, local restatement of CNDLX-27's
+contract (`src/api-contract.ts`) because CNDLX-27 had not merged yet. That
+temporary file is now gone; the CLI imports `src/api/contract.ts`, the
+real, merged contract module, directly — including its `apiSocketPath`
+resolver, so the CLI and the daemon it talks to derive the socket path
+from the same function. See "The candlestix CLI" below for what shipped
+and the real end-to-end demonstration against a real daemon and a real
+`claude --bg` session. No webapp yet (CNDLX-16); the daemon-opens-a-window
 form of attach is still not built (CNDLX-3).
 
 ## Health (`src/health/`)
@@ -415,6 +437,20 @@ run with the process's `cwd` set to the agent's own directory
 passed an empty string — since `job` is optional on a daemon-created
 agent, unlike a roster entry's (which was required).
 
+**CNDLX-33 defect 3:** an empty or whitespace-only `job` is *present*, not
+absent, and `spawnDaemonAgent` itself only ever checked `!== undefined` —
+so before this fix it reached spawn as `--append-system-prompt ""`,
+violating R3 (job absent means the flag is omitted, not passed empty).
+Fixed at `createAgent` (`agent-actions.ts`), the core layer both the API
+and any direct caller go through — not in the HTTP handler alone: an
+empty or whitespace-only `job` is now refused as a typed `invalid-job`
+before an id is even minted. **Chose refuse over silently normalizing to
+absent** (the epic's own stated preference): an operator who typed an
+empty job probably meant something, and saying so beats silently
+dropping it. A record with `job: ""` can therefore no longer be created
+through this path; see "Known gaps" for the one path this does not cover
+(a hand-edited or pre-this-fix store entry).
+
 ### Why `claude --bg`
 
 Verified live rather than assumed from `--help` text: `claude --bg` needs
@@ -614,6 +650,220 @@ against this branch: **bun 1.3.14**, `bun run check` → **289 pass, 0
 fail**, typecheck clean, build clean. `package.json` still has no
 `dependencies` key.
 
+## Demonstrations — CNDLX-32 (the daemon API over a Unix socket)
+
+Run 2026-09-11, driving the daemon **as a real foreground `bun run
+src/index.ts` process** with `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME`/
+`$XDG_RUNTIME_DIR` all pointed at a dedicated scratch tree, entirely
+separate from this daemon's own state — never the real candlestix state,
+never a real systemd unit installed/started/stopped. **`claude` and
+`systemd-run` were both stubbed**, said plainly: two small Python scripts
+on `PATH` ahead of the real binaries, backing `claude agents --json
+[--cwd]` / `stop` / `rm` and `systemd-run ... -- claude --bg ...` with a
+shared JSON "sessions" file, so the daemon's real parsing/matching code
+(`agents-cli.ts`, `agent-session.ts`) runs against something real rather
+than being mocked out. Every check below states the failure condition
+before running it.
+
+**1. Socket mode, before anything else.** `stat` on the bound socket and
+its directory: `600 .../candlestix/api.sock` and `700
+.../candlestix` — exactly section 1's requirement, not merely "the chmod
+call didn't throw."
+
+**2. The full lifecycle, over `curl --unix-socket`, one agent:**
+
+```
+GET  /v1/agents                              → {"ok":true,"agents":[]}
+POST /v1/agents {"name":"demo-worker"}       → {"ok":true,"agent":{"id":"@01m27hmep77xg54nw8","name":"demo-worker","state":"on",...}}
+# independent stat: .../agents/@01m27hmep77xg54nw8 exists; .../agents/@notreal00000000000 does not (control)
+POST .../rename {"name":"demo-worker-renamed"} → {"ok":true,"agent":{...,"name":"demo-worker-renamed",...}}
+# independent stat: the SAME id-keyed directory path still exists — rename never moved it
+POST .../off                                  → {"ok":true,"outcome":{"kind":"turned-off"}}
+# control: claude agents --cwd <dir> went from 1 entry to 0 after this call
+POST .../off  (again)                         → {"ok":true,"outcome":{"kind":"no-change"}}   # not an error
+POST .../archive                              → {"ok":true,"outcome":{"kind":"archived"}}
+GET  .../attach-target                        → 409 {"ok":false,"error":{"kind":"archived","message":"agent is archived; ..."}}
+POST .../unarchive                            → {"ok":true,"outcome":{"kind":"unarchived"}}   # lands on off, GET /v1/agents confirmed state:"off"
+POST .../on                                   → {"ok":true,"outcome":{"kind":"turned-on"}}     # spawns via the stubbed systemd-run
+GET  .../attach-target                        → 200 {"ok":true,"target":{"agentId":"...","agentName":"demo-worker-renamed","sessionShortId":"sess-jqchmm","sessionId":"sess-jqchmm-bdp8my7y"}}
+POST .../open-terminal                        → 501 {"ok":false,"error":{"kind":"not-implemented","epic":"CNDLX-3","message":"opening a terminal window is not built yet — CNDLX-3 implements it. ..."}}
+POST .../delete                               → {"ok":true,"outcome":{"kind":"deleted"}}
+# independent stat: the directory is gone; GET /v1/agents is back to {"ok":true,"agents":[]}
+```
+
+Every status code above matched `statusForErrorKind`'s table exactly
+(archived → 409, not-implemented → 501) — checked by `curl -w
+'HTTP_STATUS:%{http_code}'` alongside each body, not inferred from the
+body alone.
+
+**3. Error shapes — never an HTML page, never a bare framework 404:**
+
+```
+GET  /v1/nope                → 404 {"ok":false,"error":{"kind":"unknown-route","method":"GET","path":"/v1/nope","message":"no route matches GET /v1/nope"}}
+POST /v1/agents  { bad json  → 400 {"ok":false,"error":{"kind":"malformed-json","message":"request body is not valid JSON: JSON Parse error: Expected '}'"}}}
+POST .../@notreal.../on      → 404 {"ok":false,"error":{"kind":"not-found","query":"@notreal00000000000","message":"no agent found named \"@notreal00000000000\""}}
+```
+
+**CNDLX-33 re-ran this section against two defects the epic found this shape did NOT yet cover — see "Demonstrations — CNDLX-33" below for the full re-run:** a malformed percent-escape in `{idOrName}` (previously a bare HTML 500 from an unguarded `decodeURIComponent`) and any other unexpected throw on the request path (previously the same HTML page, from `Bun.serve` having no `error` handler at all). Both are now this same typed JSON shape — `malformed-path` (400) and `internal-error` (500) — never an HTML page, on every route.
+
+**4. Single-writer serialization, for real, not just the unit test's
+generic critical section:** 15 concurrent `POST /v1/agents` fired as
+background shell jobs against the SAME live socket, `wait`ed, then `GET
+/v1/agents` — **15 agents, 15 unique names, nothing lost.** (The
+generic negative control — the same shape of race demonstrably losing an
+update WITHOUT the queue — lives in `test/unit/mutation-queue.test.ts`
+and is re-run against this exact HTTP dispatch path with a no-op queue in
+`test/unit/api/server.test.ts`; repeating that specific negative case
+against a live foreground daemon would require deliberately shipping an
+unserialized build, which was not done here.)
+
+**5. Clean shutdown removes the socket.** `SIGTERM` → log line `received
+SIGTERM, shutting down` then `supervisor loop, health timers, and the api
+server are stopped` → `stat` on the socket path fails with ENOENT
+immediately after. Process confirmed gone via `ps -p`.
+
+**6. Refuses to steal a LIVE socket, loudly, naming the path — real
+process, not a unit test.** With daemon A still running, a second daemon
+process (B) started against the identical socket path: **exit code 1**,
+log line `ERROR refusing to start: another candlestix daemon for this
+user is already listening on ".../api.sock" — never stealing a live
+socket`. Negative control confirmed in the same run: daemon A, unaffected
+by B's refused attempt, still answered `GET /v1/agents` correctly
+immediately after.
+
+**7. Reclaims a STALE socket — the negative control for #6, with a real
+crash, not a clean stop.** Daemon A's process was `SIGKILL`ed directly
+(no chance to run its own shutdown/unlink code) — the socket file
+survived the kill exactly as a real crash would leave it (`stat` still
+showed `mode 600`), and a `curl` against it failed with `curl: (7)
+Couldn't connect` (nothing listening any more). A third daemon (C)
+started against that same path: **bound successfully**, and `GET
+/v1/agents` immediately returned the full 15-agent list from before the
+crash — genuinely reclaimed and serving, not the dead listener.
+
+**A stubbed `claude`, stated plainly, and what it does NOT prove:** the
+"session" pids in this demonstration are short-lived Python processes
+that had already exited by the time the reconcile loop's own
+`isPidAlive` check ran on them — visible in the daemon's own log as
+repeated, honest `WARN ...: session "..." reported pid ..., which did not
+independently verify as alive; not recording a heartbeat this cycle`
+lines. This is the reconcile loop behaving exactly as designed (never
+fabricating health) and is **not** evidence about attach-target, which
+does not consult pid liveness at all — only that a live `claude agents
+--json` entry exists under the agent's directory, which the stub does
+provide honestly. The real-session case (a genuine `claude --bg` process
+staying alive) is demonstrated for real by CNDLX-31 — see "The real
+end-to-end demonstration" under "The candlestix CLI" below — not by this
+section's own, deliberately stubbed run.
+
+**Host confirmed back at baseline** after this demonstration: all three
+demo daemon processes stopped (`ps aux` checked — the two other
+`bun run src/index.ts` processes visible on this shared host predate this
+session and were never touched), the entire scratch demo tree removed,
+zero references to real `$XDG_STATE_HOME/candlestix` or
+`$XDG_RUNTIME_DIR/candlestix` anywhere in this demonstration.
+
+**Suite/typecheck/build on this branch:** **bun 1.3.14** (this host's
+shared `bun`) → `bun run check` → **337 pass, 0 fail**, typecheck clean,
+build clean. Separately, against a **genuine bun 1.3.11** installed into
+a scratch directory inside this task's own workspace by bun's own
+installer (leaving the shared `bun` untouched):
+
+```
+$ <scratch>/bin/bun --version
+1.3.11
+$ <scratch>/bin/bun test
+ 337 pass
+ 0 fail
+Ran 337 tests across 28 files.
+$ <scratch>/bin/bun run build
+Bundled 30 modules in 7ms
+  index.js  64.11 KB  (entry point)
+```
+
+`package.json` still has no `dependencies` key.
+
+## Demonstrations — CNDLX-33 (fix epic review findings)
+
+Run 2026-09-11, driving `startApiServer` (`src/api/server.ts`) directly over
+a **real Unix socket**, scratch XDG-shaped temp dirs, a stubbed
+`runCommand` that throws loudly rather than silently succeeding if ever
+actually invoked (never touched, said plainly, in either check below). Every
+check states the failure condition before running it. This is the same
+"error shapes" section CNDLX-32 demonstrated (see above), re-run with the
+two new cases this task adds.
+
+**1. The malformed percent-escape (defect 1a).** Failure condition: an HTML
+body, a non-400 status, or any `kind` other than `malformed-path`.
+
+```
+GET  /v1/agents/%E0%A4%A/attach-target
+  -> 400 application/json
+  {"ok":false,"error":{"kind":"malformed-path","message":"the path segment \"%E0%A4%A\" is not a valid percent-encoded value: URI error"}}
+POST /v1/agents/%E0%A4%A/on
+  -> 400 application/json
+  {"ok":false,"error":{"kind":"malformed-path","message":"the path segment \"%E0%A4%A\" is not a valid percent-encoded value: URI error"}}
+```
+
+**Control**, same run, immediately after: a validly-escaped but unknown
+`idOrName` on the identical route still gets its normal typed 404, proving
+the 400 above is specific to the decode failure, not a change to
+not-found's own behaviour:
+
+```
+GET  /v1/agents/%40nope/attach-target
+  -> 404 application/json
+  {"ok":false,"error":{"kind":"not-found","query":"@nope","message":"no agent found named \"@nope\""}}
+```
+
+**2. The catch-all (defect 1b).** An injected fault — `mcpConfigPath`
+throwing synchronously, a dependency nothing in `agent-actions.ts` wraps in
+its own try/catch — reaching `createAgent` via a real `POST /v1/agents`.
+Failure condition: the response contains the injected string
+(`"injected-fault: ..."`), any stack-trace-shaped text, a status other than
+500, or nothing appearing in the daemon's own log.
+
+```
+[server stderr] [2026-09-11T07:12:17.221Z] ERROR unhandled error handling POST http://localhost/v1/agents: Error: injected-fault: mcpConfigPath threw instead of returning a path
+    at mcpConfigPath (.../live-demo-defects.ts:28:17)
+    at createAgent (src/agent-actions.ts:268:90)
+
+POST /v1/agents {"name":"demo"}
+  -> 500 application/json
+  {"ok":false,"error":{"kind":"internal-error","message":"an unexpected internal error occurred; see the daemon's own log for detail"}}
+```
+
+The full detail (message + stack) reached the log; **none of it — not the
+injected string, not a stack frame — reached the response body.**
+
+**Control**, same run, same socket, immediately after: `GET /v1/agents` (a
+route that never calls `mcpConfigPath`) still answers normally:
+
+```
+GET  /v1/agents -> 200 application/json {"ok":true,"agents":[]}
+```
+
+**3. Defect 2 (strict create/rename body shape) and defect 3 (R3's
+empty-job rule)** are demonstrated exhaustively as unit tests
+(`test/unit/api/server.test.ts`'s two new `describe` blocks, and
+`test/unit/agent-actions.test.ts`'s "R11" block) rather than repeated here
+live — every row of the epic's own repro table, each with a control, plus
+the "a rejected body spawns nothing" assertion on recorded commands the
+epic explicitly required (not inferred from the status code). Chose to
+show 1a/1b live here specifically because they are the two cases that
+previously escaped the JSON error shape entirely (an HTML page) — the
+thing this section exists to prove is fixed.
+
+**Suite/typecheck/build on this branch:** `bun run check` → **357 pass, 0
+fail** (337 inherited + 20 new), typecheck clean, build clean. The two
+exhaustiveness mechanisms were verified live, not just asserted, the same
+way CNDLX-27/32 verified theirs: `ERROR_STATUS` (`src/api/contract.ts`)
+with `"malformed-path": 400` temporarily deleted failed `bun run
+typecheck` with `TS2741: Property '"malformed-path"' is missing in type
+...`, naming exactly that kind; restoring it passed. `ALL_WIRE_ERROR_KINDS`
+(`src/error-wire-format.ts`) with `"invalid-job"` temporarily deleted
+failed the same way (`TS2345`); restored, passed.
+
 ## systemd user unit (`systemd/candlestix.service`)
 
 Install as a **user** unit — not a system unit, which is a different thing
@@ -693,6 +943,7 @@ candlestix entirely.)
 | Registry (id-keyed, CNDLX-19 T4) | `$XDG_RUNTIME_DIR/candlestix/registry.json` | daemon restart, not reboot |
 | Health signal | `$XDG_RUNTIME_DIR/candlestix/health.json` | daemon restart, not reboot |
 | Per-agent MCP config (`agentMcpConfigPath`, R16, id-keyed) | `$XDG_RUNTIME_DIR/candlestix/agents/<id>/mcp.json` | daemon restart, not reboot |
+| **Daemon API socket (`apiSocketPath`, CNDLX-32)** | `$XDG_RUNTIME_DIR/candlestix/api.sock` | daemon restart, not reboot — removed on clean shutdown, reclaimed if stale on startup |
 | Durable agent set | `$XDG_STATE_HOME/candlestix/agents.json`, falling back to `~/.local/state/candlestix/agents.json` | **reboot** |
 | Per-agent directory (CNDLX-23, S1) | `$XDG_STATE_HOME/candlestix/agents/<id>/`, same fallback base | **reboot** |
 
@@ -757,9 +1008,13 @@ Delivered by CNDLX-18, on top of everything in "The durable agent set"
 above: the eight verbs — `create`, `on`, `off`, `rename`, `archive`,
 `unarchive`, `delete`, `list` — as plain callable functions. **As of
 CNDLX-19, the state these verbs write is exactly what the reconcile loop
-reads** — see "Supervisor loop" above. Still no CLI, no HTTP, no API, no
-UI (CNDLX-15's scope), and `attach` is still not built (CNDLX-3's scope,
-left a seam).
+reads** — see "Supervisor loop" above. **As of CNDLX-32, these are also
+exactly the functions the daemon API calls** — see "The daemon API"
+below. **As of CNDLX-30/CNDLX-31, the `candlestix` CLI is a thin client of
+that same API**, including a real, working in-place `attach` (see "The
+candlestix CLI" below) — R18's `attach-target` query and the
+`open-terminal` seam are both built too, see below. No webapp yet
+(CNDLX-16's scope).
 
 - **`agent-lifecycle.ts`** — the PURE transition rules (R9): `decideOn`/
   `decideOff`/`decideArchive`/`decideUnarchive`/`decideDelete`, each a
@@ -794,37 +1049,356 @@ left a seam).
   the store write only after every effect has succeeded** — and when the
   store write itself then fails, report a typed `store-write-failed`
   naming exactly which effect already happened, rather than leaving an
-  unhandled rejection or a silently-stale record.
+  unhandled rejection or a silently-stale record. `createAgent` also
+  refuses an empty/whitespace-only `job` as a typed `invalid-job`
+  (CNDLX-33 defect 3, R3) — before minting an id, so no directory or
+  session is ever touched for a refused create.
 
-## The candlestix CLI (`src/cli/`, `src/api-contract.ts`)
+## The daemon API (`src/api/`, `src/attach-target.ts`, `src/open-terminal.ts`, `src/mutation-queue.ts`)
 
-CNDLX-30's task: the human-facing surface. **`candlestix` is a thin client
-of the daemon API — it never touches the store, the agent set, or any
-action/lifecycle module directly.** Every state-changing thing it does goes
-out over HTTP, on a Unix domain socket, to the daemon. A reviewer can check
-this by grep: nothing under `src/cli/` or in `src/api-contract.ts` imports
-`agent-actions.ts`, `agent-set.ts`, `agent-set-store.ts`, `agent-resolver.ts`,
-`agent-session.ts`, `agent-spawn.ts`, `agent-directory.ts` or `agent-id.ts` —
-the one exception, `src/agent.ts`'s `AgentRecord` **type**, is imported
-type-only, for the wire shape, never as a runtime value.
+Delivered by CNDLX-32 (CNDLX-27's task): the whole eight-verb action set,
+plus `attach-target` and the `open-terminal` seam, reachable over
+**HTTP/1.1 with JSON bodies, over a Unix domain socket.** No TCP listener.
 
-### The temporary contract module — read this before touching anything else here
+### Why a Unix socket, and why HTTP over it
 
-**`src/api-contract.ts` does not belong to this story.** The daemon API —
-its socket, its routes, its wire types — is CNDLX-27's story, built in
-parallel with this one and not yet merged as this CLI was written. This
-file is CNDLX-30's own best-effort restatement of that contract: a socket
-path resolver, the route table, and the wire envelope/success types, all
-guessed or restated rather than verified against a real server (none
-exists yet). **Every other CLI module imports contract-shaped things ONLY
-from this one file.**
+**Authentication is the filesystem: only the same Unix user can connect.**
+This API can delete an operator's agents and their conversations; the only
+client this epic ships (the CLI, CNDLX-28) runs on the same machine as the
+same user. A TCP port would expose delete-everything to anything that can
+reach it, and would need an auth design nothing here has a client for.
 
-**When CNDLX-27 merges, CNDLX-31 (a later task, not this one) deletes this
-file outright** and repoints every one of those imports at CNDLX-27's real
-contract module, reconciling field names (attach-target's response shape
-most of all — this file's version is a guess) against what actually
-shipped. That swap should touch imports only, never grammar, rendering, or
-the test suite's behavioural expectations.
+**HTTP keeps every route and body transport-independent** — the load-
+bearing half of the choice. When CNDLX-16 needs a browser that is not on
+the daemon's machine, it can add an authenticated listener, or a proxy
+onto this socket, **additively, without changing a single route.** A
+bespoke line protocol over the socket would have been simpler today and
+would have made that later step a rewrite instead.
+
+### Where the socket lives, and how its path is resolved
+
+`xdg.ts`'s `apiSocketPath` (wrapped by `paths.ts`'s impure
+`apiSocketPath()`) resolves to `$XDG_RUNTIME_DIR/candlestix/api.sock` —
+the ONE function both the daemon (which binds it) and any client (the
+CLI) call, so the two surfaces cannot disagree about where the socket is.
+Same file both the registry and the health signal already live beside.
+
+- **Socket file mode `0600`, its containing directory mode `0700`** —
+  `startApiServer` (`src/api/server.ts`) `chmod`s both explicitly after
+  creation, since `mkdir`'s own `mode` is subject to umask and is a no-op
+  when the directory already existed. Asserted with `stat` in
+  `test/unit/api/server.test.ts`, not assumed from the `chmod` call
+  succeeding.
+- **Startup never steals a live socket.** If the socket path already
+  exists, the daemon probes it with a real `Bun.connect` before doing
+  anything else: if something answers, this is another candlestix daemon
+  for this user already running, and startup **refuses, loudly, naming
+  the full path** — the whole daemon process exits nonzero, not just the
+  API component, since a second daemon writing the same store is exactly
+  the two-writer hazard "Single-writer serialization" below exists to
+  prevent, now at the process level rather than the in-process level.
+  Verified live (not merely reasoned about): `Bun.serve({unix: path})`
+  itself does **not** refuse to bind over a path something is already
+  listening on — it silently rebinds, which is the exact "steal" this
+  probe exists to prevent by running strictly BEFORE any call to
+  `Bun.serve`, never after.
+- **A stale socket (file present, nothing listening — the ordinary
+  shape of an unclean shutdown) is unlinked and re-bound.** The negative
+  control that makes "refuses to steal" a real claim rather than "always
+  refuses": `test/unit/api/server.test.ts` kills a real, separate `bun`
+  process with `SIGKILL` (so it never gets a chance to clean up after
+  itself — a `server.stop()` called in the same process, by contrast,
+  unlinks its own socket file, which does NOT reproduce this case) and
+  shows the daemon reclaims the leftover file rather than refusing.
+- **Clean shutdown removes the socket file** — `src/index.ts`'s shutdown
+  handler calls the returned handle's `stop()`, which stops accepting
+  connections and unlinks the socket.
+
+### The route table
+
+`{idOrName}` is one URL-encoded path segment, resolved by CNDLX-17's ONE
+id/name resolver (never a second one). Defined once, in
+`src/api/contract.ts`, which the CLI (CNDLX-28) imports rather than
+restating.
+
+| Method | Path | Body | Does |
+|---|---|---|---|
+| GET | `/v1/agents` | — | list — every non-deleted agent, archived included (R10) |
+| POST | `/v1/agents` | `{name?, job?}` | create (mint id, make directory, start). `job` exists **only** here (R3) |
+| POST | `/v1/agents/{idOrName}/on` \| `off` \| `archive` \| `unarchive` \| `delete` | — | the matching action |
+| POST | `/v1/agents/{idOrName}/rename` | `{name}` | rename; never moves the directory |
+| GET | `/v1/agents/{idOrName}/attach-target` | — | the R18 attach query |
+| POST | `/v1/agents/{idOrName}/open-terminal` | — | the window-opening seam for CNDLX-3 |
+
+**Every body above is checked for shape, not just field types (CNDLX-33
+defect 2).** A body is either absent (meaning `{}`) or a JSON object whose
+keys are a subset of the ones listed — a bare string/number/array/`null`,
+or an object with an unrecognized key (a typo'd field name), is a typed
+`invalid-request-body` naming exactly what was wrong, **before** any
+create/rename is attempted. Before this fix, `createAgent`'s handler did
+`bodyResult.body ?? {}` and read `.name`/`.job` off whatever survived that
+— a string, number, array, or `null` body all minted an agent and spawned
+a session, and a misspelled key (`{"nmae":"typo"}`) silently produced an
+unnamed agent rather than reporting the typo. **A rejected body now spawns
+nothing**, verified on recorded commands, not inferred from the status
+code (`test/unit/api/server.test.ts`).
+
+### The response body IS the action's own result union
+
+Serialized as-is: `{ok:true, ...}` or `{ok:false, error:{kind, message, ...}}`.
+`src/api/contract.ts` re-exports the action set's own result types rather
+than restating a parallel set that could drift from what the server
+actually executes. **HTTP status is a coarse hint, not the contract** — a
+client reading only the body must be fully correct without ever consulting
+it:
+
+| status | when |
+|---|---|
+| 200 | every `ok:true` |
+| 400 | `invalid-name`, `invalid-request-body`, `malformed-json`, `malformed-path`, `invalid-job` |
+| 404 | `not-found` (unknown id-or-name), `unknown-route` |
+| 409 | `ambiguous`, `name-taken`, `already-archived`, `archived`, `not-archived`, `off`, `no-live-session`, `multiple-live-sessions` — every state-conflict refusal |
+| 501 | `not-implemented` (open-terminal, honestly) |
+| 500 | `store-malformed`, `store-write-failed`, `session-lookup-failed`, `session-cleanup-failed`, `directory-create-failed`, `spawn-failed`, `directory-removal-failed`, `internal-error` — daemon-side trouble, never the client's fault |
+
+**`malformed-path` (CNDLX-33 defect 1a) and `internal-error` (CNDLX-33
+defect 1b)** are new in this task: a malformed percent-escape in
+`{idOrName}` and a catch-all around every unexpected throw on the request
+path, respectively — both previously reached the client as `Bun.serve`'s
+own default HTML error page, never this table. `internal-error` **logs
+the real detail server-side (`src/log.ts`) and never returns it, or a
+stack trace, to the client** — see "Demonstrations — CNDLX-33" below.
+`invalid-job` (CNDLX-33 defect 3) is `createAgent`'s own refusal of an
+empty/whitespace-only `job`, part of `CreateAgentError` rather than this
+API layer's own `ApiServerError` — same table, same enforcement.
+
+The exact mapping is `src/api/contract.ts`'s `statusForErrorKind`, a pure
+function kept exhaustive over the same two kind-unions
+`error-wire-format.ts` enumerates (see below) — a kind missing from either
+fails `bun run typecheck`.
+
+An **unknown route**, a **malformed JSON body**, a **malformed
+percent-escape in `{idOrName}`**, or **any other unexpected throw
+anywhere on the request path** gets this same JSON error shape, never an
+HTML page, an empty body, or a bare framework 404 or 500 — see
+`test/unit/api/server.test.ts`. The last of these is enforced by a
+catch-all wrapping every request (`handleRequest` in `src/api/server.ts`,
+plus `Bun.serve`'s own `error` option as defense-in-depth): **this claim
+used to be false** — before CNDLX-33, `Bun.serve` was constructed with no
+`error` handler at all and the route matcher's `decodeURIComponent` was
+unguarded, so both cases reached the client as Bun's default HTML page.
+
+### Every refusal carries a server-produced `message` (R8's gap, closed)
+
+At CNDLX-27's read of `f261c9b`, nine variants that reach the wire carried
+`error`/`query`/`reason`/`failed` fields but no `message`: the resolver's
+`not-found` and `ambiguous`, `store-malformed`, `store-write-failed`,
+`session-lookup-failed`, `session-cleanup-failed`,
+`directory-create-failed`, `spawn-failed`, `directory-removal-failed`. All
+nine now carry a server-produced `message` alongside their existing
+structured fields — nothing a client might want was dropped.
+
+**The fix is in core** (`agent-resolver.ts`, `agent-actions.ts`), not in
+this API layer — a surface patching in wording after the fact is exactly
+the second vocabulary R8 forbids, and there would end up being three of
+them once the CLI and webapp each did their own. This API layer, the CLI,
+and the webapp all show the same core-produced string verbatim.
+
+**The evidence is `src/error-wire-format.ts`, not spot checks.** It
+enumerates every error kind reachable at the wire (a strict superset of
+the original nine — attach-target's and open-terminal's own new refusals
+are held to the identical standard from the start) via **two independent,
+exhaustive mechanisms**, both of which fail `bun run typecheck` the moment
+a new error variant is added anywhere in the action set without being
+accounted for here:
+
+1. `ALL_WIRE_ERROR_KINDS`, an array checked against
+   `AnyActionError["kind"]` by a `checkExhaustive` helper — a missing kind
+   fails to typecheck, naming the missing kind in the compiler error.
+2. `hasServerMessage`'s own `switch`, with a `default: assertNever(err)`
+   branch that only compiles if every kind was handled.
+
+`test/unit/error-wire-format.test.ts` then iterates
+`ALL_WIRE_ERROR_KINDS` — never a hand-written list of its own — asserting
+`hasServerMessage` is true for a minimal fixture of every kind, **with a
+negative-control fixture (message missing, and separately message
+empty) proving the check can actually fail, not just always pass.**
+
+### `attach-target` — R18, one query, never an act (`src/attach-target.ts`)
+
+Resolves `{idOrName}`, then refuses or returns the live session:
+
+- **`off`** → refused; message says it is off and `on` is the way. Never silently started.
+- **`archived`** → refused, same reasoning.
+- **Unknown id-or-name** → the typed `not-found`.
+- **`on` + exactly one live session** → `{ok:true}` with the agent's id,
+  its name if any, the session's **short id** (what `claude attach <id>`
+  takes — `agents-cli.ts`'s `BackgroundAgentInfo.id`) and the full session
+  id (`.sessionId`).
+- **`on` + zero live sessions** → a typed refusal saying so and that it is
+  being brought back. Not a hang, not a spawn.
+- **`on` + more than one** → a typed refusal **listing every one** —
+  never picks the first match (R15's mirror gap).
+
+**The decision (`decideAttachTarget`) is pure and unit-tested per branch**,
+zero and multiple sessions included, with no lookup to mock — R9's split,
+applied here exactly as `agent-lifecycle.ts` applies it to the eight verbs.
+The impure wrapper (`getAttachTarget`) loads the store, resolves, calls
+`agent-session.ts`'s `findAgentSessions` (already "the lookup half of
+attach" per CNDLX-14's own doc) under the agent's directory, then hands
+both to the pure decision.
+
+**Two attaches at once is correct, and candlestix does not arbitrate it.**
+attach-target is a read-only query; handing the same target to two
+simultaneous callers is not a conflict to resolve. The terminal is the
+caller's concern (R18) — what two simultaneous `claude attach` clients
+actually do is Claude Code's own behaviour. Unlike the mutating verbs
+below, attach-target is **not** run through the mutation queue.
+
+**Measured for real (CNDLX-31): two simultaneous `candlestix <agent>`
+attaches, each through its own real pseudo-terminal, to the same live
+`claude --bg` session — no harm observed.** Both terminals rendered the
+same shared session view; a message typed in terminal A and a message
+typed in terminal B were both processed in order, and both terminals'
+own screens showed both exchanges (proof the two attaches are two windows
+onto one shared session, not two independent forks of it). Detaching
+terminal A (`Ctrl+Z`, exit `0`) left terminal B fully functional — a
+further message typed in B afterward was answered normally. `claude
+agents --json`, read independently after the whole measurement, showed
+the same session id and pid throughout, `status: "idle"`, never a
+crash or a second process. `claude logs <id>`, read independently, showed
+every probe word from both terminals present exactly once each, in
+order — no lost or corrupted turn. **Conclusion: candlestix's "do not
+lock or arbitrate" ruling is safe as measured.** No lock was invented.
+The falsifier that would have stopped this task and escalated to the
+epic — a corrupted session, a lost conversation turn, or one client
+silently killing the other — was not observed. See the PR description
+for the full transcript.
+
+### `open-terminal` — the honest seam for CNDLX-3 (`src/open-terminal.ts`)
+
+Opening a terminal window on the operator's desktop is **webapp-only**
+(the human's correction of 2026-09-10) and is CNDLX-3's to implement. This
+task defines the endpoint so CNDLX-16 has something to call:
+
+- Runs the **exact same** attach-target query first — not-found, off,
+  archived, zero-session, and multi-session refusals are **byte-for-byte
+  identical** to attach-target's own (shared code, never restated
+  branches; `test/unit/open-terminal.test.ts` checks this directly).
+- **Only when attach-target would have succeeded** does it return a typed
+  `not-implemented` refusal, naming **CNDLX-3** honestly. Never a stub
+  that pretends to work.
+- Named `open-terminal`, deliberately not "attach", so no reader confuses
+  this daemon-opens-a-window path with the CLI's in-place attach.
+- **Reserved in `agent-lifecycle.ts`'s ONE `RESERVED_AGENT_NAMES` list**,
+  in this same PR, per R17's standing rule ("whoever names a new verb
+  reserves it at the same moment") — `test/unit/agent-actions.test.ts`
+  checks both `create` and `rename` refuse it, each with a control
+  showing an unreserved lookalike name still passes.
+
+### Single-writer serialization (`src/mutation-queue.ts`)
+
+Until this task, nothing ever called the action set concurrently — no
+server existed. Once an API exists, two concurrent requests can each
+`load → modify → save` the durable agent set, and the second save can
+silently clobber the first's change. Every **mutating** route
+(`create`/`on`/off`/`archive`/`unarchive`/`delete`/`rename`) now runs
+through a plain FIFO promise-chain mutex inside the daemon process — no
+lock object, no semaphore, nothing that can deadlock. `list`,
+`attach-target`, and `open-terminal` are read-only and are **not** queued.
+
+**What was checked about the reconcile loop, so the queue's scope is
+exactly right:** `supervisor.ts` **loads** the agent set every cycle but
+calls no `saveAgentSet` on that path — verified by reading the module, not
+assumed. So the API server is the **only writer** in the process, and
+serializing mutating API requests against each other is sufficient; there
+is no second writer to also coordinate with.
+
+**Proof, not just a mutex object existing** (`test/unit/mutation-queue.test.ts`
+and `test/unit/api/server.test.ts`): a critical section shaped exactly
+like `agent-actions.ts`'s own verbs (read the whole shared value, await —
+simulating the real I/O window between load and save — then write back a
+value computed from the now-stale copy) is fired concurrently twice, both
+**without** the queue (the negative control: an update is lost) and
+**with** it (both land). The same distinction is then run again on the
+**real HTTP dispatch path** (`handleRequest`), passing a no-op
+pass-through queue vs. the real one, then with 15 concurrent real
+`POST /v1/agents` requests over a real temp-dir store, confirmed by a
+fresh `loadAgentSet` read independent of the in-memory dispatch.
+
+### `curl` example
+
+```sh
+# The daemon logs its resolved socket path at startup ("api server
+# listening on unix socket ..."); with scratch XDG dirs it is
+# $XDG_RUNTIME_DIR/candlestix/api.sock.
+curl --unix-socket "$XDG_RUNTIME_DIR/candlestix/api.sock" http://localhost/v1/agents
+# {"ok":true,"agents":[]}
+```
+
+See "Demonstrations" below for the full behavioural walkthrough (create,
+list, rename, off/no-change, archive, attach-target, unarchive, delete)
+driven entirely through `curl --unix-socket` against a foreground daemon
+with scratch XDG dirs.
+
+## The candlestix CLI (`src/cli/`)
+
+CNDLX-30 built the human-facing surface; CNDLX-31 rebased it onto CNDLX-27's
+real, merged daemon API and ran the real end-to-end demonstration below.
+**`candlestix` is a thin client of the daemon API — it never touches the
+store, the agent set, or any action/lifecycle module directly.** Every
+state-changing thing it does goes out over HTTP, on a Unix domain socket,
+to the daemon. A reviewer can check this by grep: nothing under `src/cli/`
+imports `agent-actions.ts`, `agent-set.ts`, `agent-set-store.ts`,
+`agent-resolver.ts`, `agent-session.ts`, `agent-spawn.ts`,
+`agent-directory.ts` or `agent-id.ts` — the one exception, `src/agent.ts`'s
+`AgentRecord` **type**, is imported type-only (via the contract module's own
+re-export), for the wire shape, never as a runtime value.
+
+### The real contract module (`src/api/contract.ts`) — the swap CNDLX-31 made
+
+CNDLX-30 was built while CNDLX-27's daemon API did not yet exist, against a
+**temporary, local restatement** of the contract it was promised
+(`src/api-contract.ts`: a guessed socket-path resolver, the route table, and
+the wire envelope/success types — none of it verified against a real server,
+because none existed yet). **CNDLX-31 deleted that file outright** once
+CNDLX-27 merged, and repointed every CLI import at `src/api/contract.ts` —
+CNDLX-27's real, merged contract module, which itself re-exports the socket
+resolver from `src/paths.ts` and the wire *response* types directly from the
+action set's own result unions (`agent-actions.ts`, `attach-target.ts`,
+`open-terminal.ts`), rather than restating them. Only the route table
+(`API_ROUTES`) and the request-body types are genuinely new to the contract
+module; the CLI's own `src/cli/api-client.ts` builds every path it calls from
+`API_ROUTES`' templates rather than hand-writing path strings a second time.
+
+**THE SOCKET-PATH DEFECT, found before it ever shipped.** The provisional
+module built `<candlestix runtime dir>/candlestix.sock` — a filename it
+guessed — while the real resolver, `apiSocketPath()` (`src/paths.ts`, bound
+by the daemon in `src/index.ts`), builds `<candlestix runtime dir>/api.sock`.
+Had this swap only corrected the filename in place, the CLI would have kept
+its own second derivation of a path that must have exactly one — safe today,
+silently divergent the next time either side's XDG-input handling changed.
+**The fix imports `apiSocketPath` itself** (`src/cli/bin.ts`), so the CLI's
+resolver *is* the daemon's, not a copy of it. Proven by
+`test/unit/cli/socket-path.test.ts` with a reference-identity check
+(`toBe`, not `toEqual`) — a negative control reconstructs the deleted
+module's own derivation shape (same XDG inputs, the guessed
+`candlestix.sock` filename) to show the identity check is capable of
+failing, not vacuously true. The end-to-end demonstration below also shows
+the running CLI reach the real daemon's actual bound socket, independently
+of the unit test.
+
+**Field-name reconciliation.** `AttachTargetSuccess`'s shape was CNDLX-30's
+own flagged most-likely-wrong guess: the temporary module put `agentId`,
+`name`, `sessionShortId` and `sessionId` flat on the success body. The real
+`AttachTargetResult` (`src/attach-target.ts`) nests them under a `target`
+field and names the agent's name field `agentName`, not `name`
+(`{ ok: true, target: { agentId, agentName, sessionShortId, sessionId } }`).
+Every other field name and shape CNDLX-30 guessed at — `agent`, `agents`,
+`outcome.kind`, the R6 no-change shapes — matched what CNDLX-27 actually
+shipped exactly; verified by reading the merged action-set result types
+directly, not inferred from a passing test (a mismatch here renders
+`undefined` silently and no fake-server test would catch it on its own).
 
 ### The grammar (`src/cli/grammar.ts`) — pure, and deliberately ignorant of names
 
@@ -879,20 +1453,45 @@ came back that isn't the `{"ok": ...}` envelope the contract promises — not
 valid JSON, or valid JSON missing `"ok"`), and `ok` (a real envelope,
 `true` or `false`). Only a real `ok:false` is ever rendered as a refusal.
 
-### Rendering and the message-less-refusal fallback (`src/cli/render.ts`)
+### Rendering, exit-code classification, and the message-less-refusal fallback (`src/cli/render.ts`)
 
 **R8, applied here:** `error.message` is printed verbatim whenever present
-— never the CLI's own wording for a refusal. **The one guard this story
-adds on top of that (the epic's explicit requirement):** if a refusal
-arrives with no `message` at all, the CLI prints exactly one generic line
-naming the `kind` and saying the daemon sent no message, rather than
-inventing per-kind wording of its own. This is unit-tested (including a
-negative control: two different missing-message kinds render two
-different lines, proving it is not a fixed string). **It is expected NEVER
-to fire against CNDLX-27's real, merged server** — CNDLX-27 is tasked with
-ensuring every wire error carries a server-produced message. If this
-branch is ever observed to fire against a real daemon, that is a CNDLX-27
+— never the CLI's own wording for a refusal. **The one guard this layer
+adds on top of that (a defensive guard, not expected to fire):** if a
+refusal arrives with no `message` at all, the CLI prints exactly one
+generic line naming the `kind` and saying the daemon sent no message,
+rather than inventing per-kind wording of its own. This is unit-tested
+(including a negative control: two different missing-message kinds render
+two different lines, proving it is not a fixed string). **It is expected
+NEVER to fire against CNDLX-27's real, merged server** — every error kind
+reachable at the wire is verified, both at compile time and at runtime
+(`src/error-wire-format.ts`, part of CNDLX-27's own suite), to carry a
+server-produced message. The end-to-end demonstration below shows no route
+reaches this fallback against the real daemon, with a stated falsifier. If
+it is ever observed to fire against a real daemon, that is a CNDLX-27
 defect to report, never something to quietly paper over here.
+
+**Exit-code classification (CNDLX-31, the epic's settled ruling) —
+`classifyRefusalExitCode`:** not every `ok:false` is the same kind of "no".
+A refusal (`already-archived`, `off`, `not-found`, a declined delete, ...)
+means the request was understood and declined — exit `1`. A **daemon-side
+failure** (`store-malformed`, `spawn-failed`, `session-lookup-failed`, ...)
+means the request was fine and the daemon itself broke — a script reading
+`1` there would wrongly conclude the request was rejected and not retry, so
+these exit `3` instead, the same code as daemon-unreachable. The `message`
+is still printed verbatim either way; only the exit code changes.
+Classified through the contract's own `statusForErrorKind(kind) >= 500`
+rather than a hand-written list of daemon-side kinds in the CLI — the same
+one-list discipline as R17, so a kind added to the daemon's union later
+lands on the right exit code with no CLI change. **The implementation trap,
+found reading the merged code and pinned by a test named after it:**
+`ERROR_STATUS[kind]` is `undefined` for a kind outside the table, and in
+JavaScript `undefined >= 500` is `false` — so the naive
+`status >= 500 ? EXIT_DAEMON_UNREACHABLE : EXIT_REFUSAL` silently sends an
+*unrecognised* kind (a newer daemon, an older CLI) to `EXIT_REFUSAL`, the
+exact opposite of the ruling. `classifyRefusalExitCode` checks
+`status === undefined` explicitly rather than relying on the comparison
+alone.
 
 R6's no-change diagonal renders distinctly from a real transition and from
 a refusal (`already off` vs. `turned off` vs. the refusal's own message,
@@ -920,10 +1519,10 @@ each asserted by its own test).
    (resolve first, then decide about the terminal) — a `--cwd`-piped or
    cron-triggered `candlestix <agent>` fails fast and clearly rather than
    hanging on a `claude attach` that can never get real input.
-4. **Not measured here, and not claimed:** what `claude attach --help`
-   prints on any host other than the one this story ran on, actual detach
-   behaviour, and two simultaneous attaches to the same session. All three
-   need a real `claude --bg` session and belong to CNDLX-31.
+4. **Measured for real (CNDLX-31), against a real daemon and a real `claude --bg` session, through a real pseudo-terminal — see the PR description's end-to-end transcript for the falsifiers and independent checks:**
+   - `claude attach --help` on this host prints exactly: *"Open the background session in this terminal. ← returns to agent view, Ctrl+Z drops back to your shell. The session keeps running either way."*
+   - **Detach (Ctrl+Z) genuinely returns control to the shell while the session keeps running** — `candlestix <agent>` exits `0` (the child's own exit code, propagated exactly, per item 2 above), and an independent `claude agents --json` read immediately after shows the same session id and pid, `status: "idle"`.
+   - **Two simultaneous attaches to the same session are safe**, per the epic's own ruling that attach-target does not lock or arbitrate — see "Two-terminal attach" in "The daemon API" below for the measurement and what was and was not observed.
 
 ### delete — confirms, never defaults to yes (`src/cli/confirm.ts`)
 
@@ -951,9 +1550,11 @@ and is asked to confirm nothing.
 | Code | Meaning | Where it comes from |
 |---|---|---|
 | `0` | success (including an R6 no-change success, e.g. "already off") | candlestix |
-| `1` | a refusal — the daemon's `error.message` verbatim, a CLI-side policy refusal (attach's non-TTY check, delete's confirmation refusal or decline) | candlestix |
+| `1` | **"candlestix asked and was told no"** — an ordinary refusal, the daemon's `error.message` verbatim; a CLI-side policy refusal (attach's non-TTY check); or delete's confirmation being **declined at the confirmation prompt** (an explicit "no", not a daemon refusal — see "delete" above) | candlestix |
 | `2` | a usage error (bad grammar) | candlestix |
-| `3` | the daemon is unreachable, or its response could not be understood | candlestix |
+| `3` | **"the daemon could not serve the request"** — unreachable, its response could not be understood, **or a daemon-side failure** (the store, a session lookup/cleanup, or a directory/spawn operation broke; the request itself was fine) | candlestix |
+
+**Exit `1` is never a daemon-side failure, and exit `3` is never "the operator said no."** A daemon-side `ok:false` (e.g. `store-malformed`, `spawn-failed`) is classified to `3`, not `1`, precisely so a script can tell "retry later, this wasn't rejected" apart from "don't retry, this was declined." See "Rendering, exit-code classification..." above for the classification rule and the trap it was built to avoid.
 
 **These four codes govern ONLY the pre-attach path — including every
 attach-target refusal.** The instant `candlestix <id|name>` successfully
@@ -1000,14 +1601,16 @@ run locally to confirm.
 
 **Getting from today's laptop state to a working `candlestix`, for the
 human — this has NOT been run on the laptop, and nobody should read it as
-having been:**
+having been.** (CNDLX-31 ran the equivalent sequence for real, but on a
+scratch host with scratch XDG dirs and a foreground daemon, never the
+installed unit or the laptop itself — see "The real end-to-end
+demonstration" below for what WAS actually run.)
 
 1. `cd ~/code/brooswit-factory/candlestix && git pull` (or wherever the
    canonical checkout lives) to pick up this change once merged.
 2. `bun install --frozen-lockfile`.
-3. Restart the daemon's user unit so it starts serving the API once
-   CNDLX-27 has merged and this CLI has rebased onto it (CNDLX-31):
-   `systemctl --user restart candlestix.service`.
+3. Restart the daemon's user unit so it starts serving the real,
+   merged API: `systemctl --user restart candlestix.service`.
 4. Put `candlestix` on `PATH`. Two ways that don't require root: `bun link`
    from the repo (creates a global bun-managed symlink), or a manual
    symlink of your own choosing, e.g.
@@ -1015,9 +1618,77 @@ having been:**
    (make sure `~/.local/bin` is on `PATH`, and that the target file is
    executable — `chmod +x`).
 5. `candlestix` (bare) should create a blank agent and print the exact
-   attach command; **this step, and every step above it, is unrun** — the
-   real end-to-end demonstration against a real daemon is CNDLX-31's job,
-   after CNDLX-27 merges.
+   attach command. **Unrun on the laptop itself** — nobody should read
+   this runbook as having been executed there — but this exact sequence
+   of effects (create, attach, off survives a daemon restart, archive,
+   delete) was run for real, end to end, against a real daemon and a
+   real `claude --bg` session on a scratch host; see the PR description's
+   transcript and "The real end-to-end demonstration" below.
+
+### The real end-to-end demonstration (CNDLX-31)
+
+Run against a **foreground** daemon (`bun run src/index.ts`, never the
+installed unit) with **scratch** `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/
+`XDG_RUNTIME_DIR` under a short-lived `/tmp` directory (kept short — see
+the sockaddr_un note below), driven entirely by the real CLI (`bun
+src/cli/bin.ts ...`) and a real `claude --bg` session, attached through a
+real pseudo-terminal. The full item-by-item transcript, each item with a
+falsifier stated before it ran and an independent check (never the CLI's
+own say-so — the durable store read directly, `claude agents --json`,
+`claude logs`, `stat`), is in the PR description; this section records
+only what it found:
+
+- **The CLI reached the real daemon's actual bound socket**, not merely
+  *some* socket: `apiSocketPath()` called from the CLI's own process
+  printed the byte-identical path the daemon's own startup log recorded
+  as what it bound, and every create/list/rename/etc. call's effect
+  showed up in the daemon's own durable store file and in `claude
+  agents --json`, both read independently of the CLI.
+- **Every item in the ticket's checklist passed**: create; attach with a
+  typed message independently confirmed in the session's own `claude
+  logs`; detach with the session independently confirmed still running;
+  rename with the directory's inode independently confirmed unchanged;
+  off, then R6's no-change on repeat off (`turned off` vs `already off`,
+  both exit `0`); off surviving a real daemon restart (SIGTERM, a fresh
+  process, one reconcile cycle) with **zero** new sessions, independently
+  checked (a **positive control** elsewhere in the same run — `on`
+  genuinely spawning a session — rules out "the loop is just broken and
+  never spawns anything"); on; archive hiding the agent from `list` while
+  `--archived` shows it, proven with a **second, still-`on` control
+  agent** so "empty list" cannot be mistaken for "list is just broken";
+  attach refused while archived and while off (verbatim messages, exit
+  `1`, and the off agent's store record independently confirmed to stay
+  `off` — never silently started); delete refused without `--yes` on a
+  non-TTY (directory independently confirmed still present) then deleting
+  with `--yes` (directory independently confirmed gone, id retired); the
+  two-terminal measurement (above).
+- **The message-less-refusal fallback never fired** — `grep`, over the
+  entire transcript, for its own telltale wording ("sent no message")
+  found zero matches.
+- **No stray session was left behind.** A final, unfiltered
+  `claude agents --json` (no `--cwd` — the whole Unix user's sessions,
+  including this host's live fleet of other agents' work) found 16
+  sessions total and confirmed, as the **negative control**, that zero of
+  them had a `cwd` under this run's scratch directory.
+- **Two probe bugs were found and fixed during this run, neither a
+  product defect** — named here per this project's own standing
+  practice of debugging the probe before filing a surprising result: (1)
+  an early independent-session check built the agent's directory path by
+  stripping the `@` from its id (mimicking `agent-spawn.ts`'s *systemd
+  unit name*, which does strip it — a different string with a different
+  purpose); `agentDirectoryPath` does not, so the check found zero
+  sessions where a real one existed until the path was corrected and
+  re-run. (2) several early exit-code assertions captured `$?` after
+  piping the command through `tee`, which captures `tee`'s exit code, not
+  the CLI's; re-run without the pipe (or reading `$?` before any further
+  command), every exit code matched what the unit tests already predicted.
+- **`sockaddr_un` length**, per the epic's own recorded artifact: the
+  scratch runtime directory was kept short (a plain `mktemp -d` under
+  `/tmp`, not nested under this task's own deep workspace path) —
+  measured at 47 bytes for the full socket path, comfortably under the
+  ~108-byte limit; never needed the relative-path fallback the epic's
+  note describes, but the margin was checked before relying on it, not
+  assumed.
 
 ## H1/H2/H3 — CNDLX-18's three handoff findings, each explicitly handled
 
@@ -1052,13 +1723,14 @@ addressed here, explicitly, per this story's own acceptance criteria:
 
 ## Known gaps — stated plainly, not implied away
 
-- **CNDLX-30 built the CLI's in-place attach — this bullet used to say
-  "not built" and is corrected here rather than left stale.** `candlestix
-  <id|name>` now resolves via a (currently fake, pending CNDLX-27) daemon
-  query and hands the terminal to `claude attach <sessionShortId>`. See
-  "The candlestix CLI" above. What is still genuinely missing: a **real**
-  daemon to query (CNDLX-27, not merged) and the real end-to-end
-  demonstration against one (CNDLX-31).
+- **The CLI's in-place attach is built AND verified against a real daemon
+  — this bullet used to say "not built", then "resolves via a currently
+  fake daemon query pending CNDLX-27", and is corrected here rather than
+  left stale a second time.** `candlestix <id|name>` resolves through the
+  real, merged `attach-target` query and hands the terminal to `claude
+  attach <sessionShortId>`, both proven against a real daemon and a real
+  `claude --bg` session (CNDLX-31 — see "The real end-to-end
+  demonstration" above). Nothing about attach remains simulated.
 - **Argv-drift correctness on wake is out of scope** (a separate epic).
   Not observed to be broken during this or prior stories' own testing, but
   candlestix does not defend against or detect drift if it ever occurs.
@@ -1086,43 +1758,38 @@ addressed here, explicitly, per this story's own acceptance criteria:
   used to say the opposite and is corrected here rather than left stale.**
   `src/index.ts`/`src/supervisor.ts` read the durable agent set every
   cycle; see "Supervisor loop" above.
-- **`attach` as a daemon-owned query (in core, over the wire) is still not
-  built — that is CNDLX-27, not this repo's `main` yet.** `agent-session.ts`'s
-  `findAgentSessions` remains the in-process lookup half CNDLX-27 will
-  build the query on top of. The **window-opening** form of attach
-  (CNDLX-3, webapp-only) is separately still not built either way.
-- **No real HTTP daemon API and no webapp yet.** CNDLX-30 (this task)
-  built the CLI half of CNDLX-15 — grammar, client, attach hand-off,
-  confirming delete — against a **temporary, local restatement**
-  (`src/api-contract.ts`) of the contract CNDLX-27 owns; CNDLX-27 itself
-  (the real socket, routes, and server) has not merged. No webapp yet
-  either (CNDLX-16).
+- **`attach-target` and `open-terminal` are built and merged (CNDLX-32/33,
+  `src/api/`).** R18's one query — resolve `<id-or-name>`, decide whether
+  it is attachable right now, return the live session identity —
+  including its short id. `open-terminal` runs the identical query, then
+  an honest `not-implemented` naming CNDLX-3, which builds the real
+  window-opening thing. The CLI's in-place attach (CNDLX-30/31) execs
+  `claude attach <sessionShortId>` against this real query.
+- **No webapp yet** — CNDLX-16's scope.
 - **How an operator adds an MCP server to a daemon-created agent is
   unowned by any current story.** S6 gives every daemon-created agent an
   empty MCP config and keeps `--strict-mcp-config`; no verb or surface
-  configures it yet.
-- **Bun version**: this story's own suite, typecheck, and build were run
-  on bun **1.3.14** — see "Demonstrations" above for the exact numbers.
-  The target laptop runs bun 1.3.11 (tracked as CNDLX-20, owned by
-  CNDLX-27, not this story); nothing added by this story relies on any
-  bun API newer than what CNDLX-17/CNDLX-18 already used
-  (`node:fs/promises`, `node:path`, `node:crypto`, `Bun.spawn`,
-  `JSON`/`Map`/`Set` — all already in use elsewhere in this tree before
-  this story).
-- **CNDLX-30 (the CLI) adds three more runtime surfaces, and could not run
-  any of them at the 1.3.11 floor either — the same situation CNDLX-27's
-  own task reported, for the same reason (only bun 1.3.14 was available on
-  this host).** `node:http`'s `socketPath` client option, `node:readline/
-  promises`, and `Bun.spawn` with `stdio: "inherit"` were each exercised
-  successfully at 1.3.14 (the CLI's own test suite proves the first
-  directly, against a fake `Bun.serve({unix, fetch})` server; the other two
-  were checked with standalone smoke scripts, not committed test code,
-  since they touch a real TTY/process rather than the fake-server harness
-  this suite otherwise uses throughout). None are newer additions to the
-  Bun/Node API surface than what CNDLX-17–19 already relied on elsewhere in
-  this tree. **Whether all three genuinely work at exactly 1.3.11 remains
-  unverified** — the pinned-CI job CNDLX-27/CNDLX-20 is adding is the actual
-  gate for that claim, same as for the rest of this tree.
+  configures it yet. Deliberately not this task's either — CNDLX-26.
+- **Bun version (CNDLX-20, resolved by CNDLX-27):** `engines.bun` is
+  `>=1.3.11`, matching the target laptop, with a CI job (`check-floor` in
+  `.github/workflows/ci.yml`) pinned to exactly `1.3.11` alongside the
+  existing `latest` job — both run typecheck, test, and build.
+- **Two attaches at once is correct, and candlestix does not arbitrate
+  it** (see "The daemon API" above) — recorded here too since it reads
+  like a gap at a glance and is in fact a deliberate ruling: what two
+  simultaneous `claude attach` clients actually do is Claude Code's own
+  behaviour, measured by CNDLX-31 below.
+- **CNDLX-33's `invalid-job` refusal is enforced at `createAgent`
+  (create-time), not at `spawnDaemonAgent` (every spawn).** R3 says `job`
+  is set at create-only and nothing in this codebase mutates it after
+  that, so this is sufficient for every path that ever calls
+  `createAgent` — but the agent-set store's own deserializer
+  (`agent-set.ts`) still accepts any string for `job`, including `""`, so
+  a hand-edited `agents.json`, or a record created before this fix
+  shipped, could still hold `job: ""` and would still reach spawn as
+  `--append-system-prompt ""` the next time `turnOn` re-spawns it. Filed
+  as CNDLX-34, destination CNDLX-2 (spawn-argv correctness) — not this
+  task's to fix.
 
 ## Tooling
 
@@ -1148,11 +1815,15 @@ bun run check                   # typecheck + test + build, in that order
 
 ## CI
 
-`.github/workflows/ci.yml` runs `typecheck`, `test`, and `build` on every
-push, pull request, and manual dispatch. Note a standing blind spot:
-`engines.bun` in `package.json` is `>=1.3.14` (the roster used to rely on
-Bun's built-in `Bun.YAML`; nothing in the current tree still does, but the
-floor has not been lowered), while CI pins `bun-version: latest`, so **CI
-structurally cannot verify that floor** — a regression against the stated
-minimum would pass CI regardless. This predates this story and is
-unchanged by it.
+`.github/workflows/ci.yml` runs two jobs, both on every push, pull
+request, and manual dispatch:
+
+- **`check`** — `bun-version: latest`, runs `typecheck`, `test`, `build`.
+- **`check-floor`** (CNDLX-20, added by this task) — pinned to exactly
+  `bun-version: "1.3.11"`, running the identical three steps. **This is
+  the load-bearing half of `engines.bun`'s `>=1.3.11` floor** — previously
+  `engines.bun` said `>=1.3.14` while CI pinned only `latest`, so nothing
+  ever actually tested the declared minimum; a regression against it
+  would have passed CI regardless. A changed number with no gate pinned
+  to it would just move the untested claim from one place to another,
+  which is why this job, not the `engines` field, is the actual fix.

@@ -279,7 +279,7 @@ describe("runCli — attach", () => {
 
   test("success: spawns claude attach with the session's short id, and PROPAGATES its exit code exactly, even when it collides with candlestix's own codes", async () => {
     await withServer(
-      () => ({ body: { ok: true, agentId: "@abc", sessionShortId: "sess42", sessionId: "sess42-full" } }),
+      () => ({ body: { ok: true, target: { agentId: "@abc", agentName: undefined, sessionShortId: "sess42", sessionId: "sess42-full" } } }),
       async (socketPath) => {
         let receivedId: string | undefined;
         const io = fakeIo({
@@ -300,7 +300,7 @@ describe("runCli — attach", () => {
   test("non-TTY: refused before ever spawning, distinct message, exit 1", async () => {
     let spawned = false;
     await withServer(
-      () => ({ body: { ok: true, agentId: "@abc", sessionShortId: "sess1", sessionId: "sess1-full" } }),
+      () => ({ body: { ok: true, target: { agentId: "@abc", agentName: undefined, sessionShortId: "sess1", sessionId: "sess1-full" } } }),
       async (socketPath) => {
         const io = fakeIo({ stdinIsTTY: false, stdoutIsTTY: false, spawnAttach: async () => { spawned = true; return 0; } });
         const exitCode = await runCli(["my-agent"], { apiClient: createApiClient({ socketPath }), io });
@@ -341,15 +341,65 @@ describe("runCli — daemon unreachable", () => {
 });
 
 describe("runCli — the message-less-refusal fallback, exercised end to end through a real command", () => {
-  test("a refusal with no message renders the generic fallback line and still exits with the refusal code", async () => {
+  test("a message-less refusal whose kind is daemon-side (>= 500, e.g. store-malformed) renders the generic fallback line AND exits with the daemon-unreachable code, not the refusal code", async () => {
     await withServer(
       () => ({ status: 500, body: { ok: false, error: { kind: "store-malformed" } } }), // no "message" field at all
       async (socketPath) => {
         const io = fakeIo();
         const exitCode = await runCli(["list"], { apiClient: createApiClient({ socketPath }), io });
-        expect(exitCode).toBe(EXIT_REFUSAL);
+        expect(exitCode).toBe(EXIT_DAEMON_UNREACHABLE);
         expect(io.stderrLog.join("")).toContain("store-malformed");
         expect(io.stderrLog.join("")).toContain("sent no message");
+      }
+    );
+  });
+
+  test("negative control: a message-less refusal whose kind is a client-side refusal (< 500, e.g. not-found) still exits with the refusal code — proves the case above isn't just 'fallback always means daemon-unreachable'", async () => {
+    await withServer(
+      () => ({ status: 404, body: { ok: false, error: { kind: "not-found" } } }), // no "message" field at all
+      async (socketPath) => {
+        const io = fakeIo();
+        const exitCode = await runCli(["list"], { apiClient: createApiClient({ socketPath }), io });
+        expect(exitCode).toBe(EXIT_REFUSAL);
+        expect(io.stderrLog.join("")).toContain("not-found");
+        expect(io.stderrLog.join("")).toContain("sent no message");
+      }
+    );
+  });
+});
+
+describe("runCli — daemon-side failures (Part 1c's ruling): exit 3, not 1, classified through statusForErrorKind", () => {
+  test("a >= 500 kind (e.g. spawn-failed) with a real message still exits the daemon-unreachable code, never the refusal code", async () => {
+    await withServer(
+      () => ({ status: 500, body: { ok: false, error: { kind: "spawn-failed", message: "starting a session failed: boom" } } }),
+      async (socketPath) => {
+        const io = fakeIo();
+        const exitCode = await runCli(["my-agent", "on"], { apiClient: createApiClient({ socketPath }), io });
+        expect(exitCode).toBe(EXIT_DAEMON_UNREACHABLE);
+        expect(io.stderrLog.join("")).toBe("starting a session failed: boom\n");
+      }
+    );
+  });
+
+  test("negative control: an ordinary < 500 refusal (e.g. already-archived) with a real message exits the refusal code, not daemon-unreachable — proves 500-classification isn't applied to every refusal", async () => {
+    await withServer(
+      () => ({ status: 409, body: { ok: false, error: { kind: "already-archived", message: "agent is archived" } } }),
+      async (socketPath) => {
+        const io = fakeIo();
+        const exitCode = await runCli(["my-agent", "on"], { apiClient: createApiClient({ socketPath }), io });
+        expect(exitCode).toBe(EXIT_REFUSAL);
+      }
+    );
+  });
+
+  test("THE TRAP: an unrecognised kind (unknown to this build's contract, e.g. a newer daemon's) exits the daemon-unreachable code, not the refusal code — the 'undefined >= 500 is false' pitfall the ticket names explicitly", async () => {
+    await withServer(
+      () => ({ status: 599, body: { ok: false, error: { kind: "some-future-kind-this-cli-has-never-heard-of", message: "from a newer daemon" } } }),
+      async (socketPath) => {
+        const io = fakeIo();
+        const exitCode = await runCli(["list"], { apiClient: createApiClient({ socketPath }), io });
+        expect(exitCode).toBe(EXIT_DAEMON_UNREACHABLE);
+        expect(io.stderrLog.join("")).toBe("from a newer daemon\n");
       }
     );
   });

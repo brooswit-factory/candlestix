@@ -16,19 +16,61 @@ describe("renderRefusal — R8: the API's message, verbatim, never our own wordi
 });
 
 describe("renderRefusal — the message-less-refusal fallback (a defensive guard, unit-tested per the epic's explicit requirement)", () => {
-  test("no message: prints ONE generic line naming the kind, never inventing per-kind wording", () => {
-    const outcome = renderRefusal({ kind: "store-malformed" });
+  test("no message, ordinary (< 500) kind: prints ONE generic line naming the kind, never inventing per-kind wording, and exits the refusal code", () => {
+    const outcome = renderRefusal({ kind: "not-found" });
     expect(outcome.exitCode).toBe(EXIT_REFUSAL);
-    expect(outcome.stderr).toContain("store-malformed");
+    expect(outcome.stderr).toContain("not-found");
     expect(outcome.stderr).toContain("sent no message");
   });
 
   test("a DIFFERENT kind with no message produces a DIFFERENT line naming ITS kind (negative control: not a fixed string)", () => {
-    const a = renderRefusal({ kind: "session-lookup-failed" });
-    const b = renderRefusal({ kind: "spawn-failed" });
-    expect(a.stderr).toContain("session-lookup-failed");
-    expect(b.stderr).toContain("spawn-failed");
+    const a = renderRefusal({ kind: "already-archived" });
+    const b = renderRefusal({ kind: "not-archived" });
+    expect(a.stderr).toContain("already-archived");
+    expect(b.stderr).toContain("not-archived");
     expect(a.stderr).not.toBe(b.stderr);
+  });
+
+  test("no message, daemon-side (>= 500) kind: still names the kind and 'sent no message', but exits the DAEMON-UNREACHABLE code, not the refusal code", () => {
+    const outcome = renderRefusal({ kind: "store-malformed" });
+    expect(outcome.exitCode).toBe(EXIT_DAEMON_UNREACHABLE);
+    expect(outcome.stderr).toContain("store-malformed");
+    expect(outcome.stderr).toContain("sent no message");
+  });
+});
+
+describe("renderRefusal — Part 1c's exit-code ruling: daemon-side (>= 500) kinds exit 3, ordinary refusals exit 1, classified via statusForErrorKind", () => {
+  test("an ordinary 4xx-mapped kind (e.g. already-archived) exits the refusal code", () => {
+    const outcome = renderRefusal({ kind: "already-archived", message: "agent is archived" });
+    expect(outcome.exitCode).toBe(EXIT_REFUSAL);
+  });
+
+  test("a 5xx-mapped kind (e.g. spawn-failed) exits the daemon-unreachable code, even though it arrives as an ordinary ok:false refusal, not a transport error", () => {
+    const outcome = renderRefusal({ kind: "spawn-failed", message: "starting a session failed: boom" });
+    expect(outcome.exitCode).toBe(EXIT_DAEMON_UNREACHABLE);
+    expect(outcome.stderr).toBe("starting a session failed: boom\n");
+  });
+
+  test("every kind this build's contract maps to >= 500 exits the daemon-unreachable code (sweeps the real table rather than spot-checking one kind)", () => {
+    const daemonSideKinds = [
+      "store-malformed",
+      "store-write-failed",
+      "session-lookup-failed",
+      "session-cleanup-failed",
+      "directory-create-failed",
+      "spawn-failed",
+      "directory-removal-failed",
+      "internal-error",
+    ];
+    for (const kind of daemonSideKinds) {
+      const outcome = renderRefusal({ kind, message: `x-${kind}` });
+      expect(outcome.exitCode).toBe(EXIT_DAEMON_UNREACHABLE);
+    }
+  });
+
+  test("THE TRAP, stated before running it: a kind unrecognised by this build's contract (e.g. a newer daemon's) must exit the daemon-unreachable code — 'undefined >= 500' is false in JS, so the naive '>= 500 ? 3 : 1' would send it to exit 1, the ruling's exact opposite. If this fails with EXIT_REFUSAL instead, that trap has been walked into.", () => {
+    const outcome = renderRefusal({ kind: "a-kind-no-build-of-this-contract-has-ever-listed", message: "from a hypothetical newer daemon" });
+    expect(outcome.exitCode).toBe(EXIT_DAEMON_UNREACHABLE);
   });
 });
 
