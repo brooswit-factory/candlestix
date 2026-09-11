@@ -1,6 +1,10 @@
-// CNDLX-23: the eight-verb action set, as plain callable functions. No CLI,
-// no HTTP, no API, no UI — those are CNDLX-15's. `attach` is deliberately
-// NOT here — it is CNDLX-3's, left a seam.
+// CNDLX-23: the eight-verb action set, as plain callable functions.
+// CNDLX-32 (this file's only caller besides the reconcile loop, plus
+// src/api/server.ts) exposes these over a daemon HTTP API; no CLI, no
+// webapp yet — those are CNDLX-28/CNDLX-16's. `attach` (the exec-in-place
+// verb) is deliberately NOT here — it is CNDLX-28's; `attach-target` (R18's
+// query) lives in attach-target.ts instead, and `open-terminal`
+// (open-terminal.ts) is a seam for CNDLX-3.
 //
 // Every action follows the same shape: load the store (refusing outright on
 // `malformed` — never treated as empty, per CNDLX-17's own module doc),
