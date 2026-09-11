@@ -145,6 +145,22 @@ describe("createAgent", () => {
     });
   });
 
+  test("refuses 'open-terminal' as a name (R17, reserved by this ticket), with a control showing an unreserved lookalike still passes", async () => {
+    await withHarness(async ({ deps }) => {
+      const reserved = await createAgent(deps, { name: "open-terminal", initialState: "off" });
+      expect(reserved.ok).toBe(false);
+      if (reserved.ok) return;
+      expect(reserved.error.kind).toBe("reserved-name");
+      if (reserved.error.kind === "reserved-name") expect(reserved.error.word).toBe("open-terminal");
+
+      // Negative control: a syntactically similar but non-reserved name must
+      // still be accepted — proves the refusal above is about the reserved
+      // list, not a syntax rule that happens to also reject "open-terminal".
+      const control = await createAgent(deps, { name: "open-terminals", initialState: "off" });
+      expect(control.ok).toBe(true);
+    });
+  });
+
   test("refuses a name already taken by another agent", async () => {
     await withHarness(async ({ deps }) => {
       await createAgent(deps, { name: "taken", initialState: "off" });
@@ -411,6 +427,24 @@ describe("renameAgent — R2, R17, and R16/S1's invariance: never moves the dire
     });
   });
 
+  test("refuses renaming onto 'open-terminal' (R17), with a control showing an unreserved lookalike still passes", async () => {
+    await withHarness(async ({ deps }) => {
+      const created = await createAgent(deps, { name: "renamer2", initialState: "off" });
+      if (!created.ok) throw new Error("setup failed");
+
+      const reserved = await renameAgent(deps, created.agent.id, "open-terminal");
+      expect(reserved.ok).toBe(false);
+      if (!reserved.ok) {
+        expect(reserved.error.kind).toBe("reserved-name");
+        if (reserved.error.kind === "reserved-name") expect(reserved.error.word).toBe("open-terminal");
+      }
+
+      // Negative control: same agent, syntactically similar but unreserved name — must succeed.
+      const control = await renameAgent(deps, created.agent.id, "open-terminals");
+      expect(control.ok).toBe(true);
+    });
+  });
+
   test("refuses a name held by a different agent, naming the current holder", async () => {
     await withHarness(async ({ deps }) => {
       const a = await createAgent(deps, { name: "holder", initialState: "off" });
@@ -577,6 +611,39 @@ describe("R11 — job is optional and never sent as an empty string", () => {
       const idx = launch!.indexOf("--append-system-prompt");
       expect(idx).toBeGreaterThan(-1);
       expect(launch![idx + 1]).toBe("watch PRs");
+    });
+  });
+
+  // CNDLX-33 defect 3: an empty or whitespace-only `job` is PRESENT, not
+  // absent — before this fix it reached spawn as `--append-system-prompt
+  // ""`, violating R3. Fixed here in `createAgent` (agent-actions.ts, the
+  // core layer both the API and any direct caller go through), not in the
+  // HTTP handler alone — option (i), refuse it, per the epic's stated
+  // preference. Failure condition for each: a refused create with job:"" or
+  // job:"   " that still reaches `queue.run`/spawns a session (a
+  // `systemd-run` command recorded) means the defect is still present.
+  test("an empty job is REFUSED as invalid-job, and nothing is spawned", async () => {
+    await withHarness(async ({ deps, commands }) => {
+      const result = await createAgent(deps, { name: "empty-job", job: "" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("invalid-job");
+      expect(commands.find((c) => c[0] === "systemd-run")).toBeUndefined();
+    });
+  });
+
+  test("a whitespace-only job is REFUSED as invalid-job, and nothing is spawned", async () => {
+    await withHarness(async ({ deps, commands }) => {
+      const result = await createAgent(deps, { name: "whitespace-job", job: "   \t  " });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("invalid-job");
+      expect(commands.find((c) => c[0] === "systemd-run")).toBeUndefined();
+    });
+  });
+
+  test("control: a real non-empty job is accepted and reaches spawn argv intact (see test above) — refusal is specific to empty/whitespace, not to `job` in general", async () => {
+    await withHarness(async ({ deps }) => {
+      const result = await createAgent(deps, { name: "real-job-control", job: "watch PRs" });
+      expect(result.ok).toBe(true);
     });
   });
 });

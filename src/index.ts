@@ -5,7 +5,18 @@ import { createHeartbeatStore } from "./health/heartbeat";
 import { startStalenessAlarm } from "./health/alarm";
 import { startHealthSignalWriter } from "./health/signal";
 import { pathExists } from "./registry-store";
-import { agentSetPath, agentsBaseDir, agentDirectoryPath, agentMcpConfigPath, registryPath, healthSignalPath, legacyRosterPath } from "./paths";
+import {
+  agentSetPath,
+  agentsBaseDir,
+  agentDirectoryPath,
+  agentMcpConfigPath,
+  registryPath,
+  healthSignalPath,
+  legacyRosterPath,
+  apiSocketPath,
+} from "./paths";
+import { startApiServer, type ApiServerHandle } from "./api/server";
+import type { AgentActionsDeps } from "./agent-actions";
 
 // This is candlestix's real cycle cadence (staleness.ts's
 // DEFAULT_STALENESS_THRESHOLD_MS was a placeholder pending exactly this).
@@ -43,7 +54,7 @@ async function warnIfLegacyRosterExists(): Promise<void> {
   if (await pathExists(path)) {
     log(
       "warn",
-      `legacy roster file found at "${path}" — it is NO LONGER READ. Agents are now created and managed entirely through candlestix's own daemon-owned agent set (create/on/off/rename/archive/unarchive/delete — see agent-actions.ts; no CLI or API surface exists yet, see CNDLX-15). This file will never be consulted again; delete it or leave it in place, either is safe, but editing it will have no effect.`
+      `legacy roster file found at "${path}" — it is NO LONGER READ. Agents are now created and managed entirely through candlestix's own daemon-owned agent set (create/on/off/rename/archive/unarchive/delete — see agent-actions.ts), reachable over the daemon's own HTTP-over-Unix-socket API (see api/server.ts, CNDLX-32) — no CLI yet (CNDLX-28, in progress). This file will never be consulted again; delete it or leave it in place, either is safe, but editing it will have no effect.`
     );
   }
 }
@@ -59,10 +70,37 @@ async function main(): Promise<void> {
   const resolvedAgentsBaseDir = agentsBaseDir();
   const resolvedRegistryPath = registryPath();
   const resolvedHealthSignalPath = healthSignalPath();
+  const resolvedApiSocketPath = apiSocketPath();
   log("info", `agent set path: ${resolvedAgentSetPath}`);
   log("info", `agents directory: ${resolvedAgentsBaseDir}`);
   log("info", `registry path: ${resolvedRegistryPath}`);
   log("info", `health signal path: ${resolvedHealthSignalPath}`);
+  log("info", `api socket path: ${resolvedApiSocketPath}`);
+
+  const apiDeps: AgentActionsDeps = {
+    agentSetPath: resolvedAgentSetPath,
+    agentsBaseDir: resolvedAgentsBaseDir,
+    agentDirectoryPath,
+    mcpConfigPath: agentMcpConfigPath,
+    runCommand,
+    now: () => new Date(),
+    random: () => Math.random(),
+  };
+
+  // Section 1's refusal-to-steal is fatal to daemon startup, not merely to
+  // the API server component: a live socket at this path means another
+  // candlestix daemon for this user is already running its own reconcile
+  // loop against the same durable state, and starting a second one anyway
+  // is exactly the "two writers" hazard section 5 exists to prevent — at
+  // the process level rather than the in-process level this ticket's own
+  // mutation queue covers.
+  const apiServerResult = await startApiServer(apiDeps, resolvedApiSocketPath);
+  if (!apiServerResult.ok) {
+    log("error", apiServerResult.error.message);
+    process.exit(1);
+  }
+  const apiServer: ApiServerHandle = apiServerResult.handle;
+  log("info", `api server listening on unix socket "${apiServer.socketPath}"`);
 
   let cycleInFlight = false;
 
@@ -127,8 +165,9 @@ async function main(): Promise<void> {
     clearInterval(reconcileTimer);
     alarm.stop();
     signal.stop();
+    apiServer.stop(); // section 1: remove the socket on clean shutdown.
 
-    log("info", "supervisor loop and health timers stopped; any spawned agents are left running for the next startup to re-adopt");
+    log("info", "supervisor loop, health timers, and the api server are stopped; any spawned agents are left running for the next startup to re-adopt");
     process.exit(0);
   };
 

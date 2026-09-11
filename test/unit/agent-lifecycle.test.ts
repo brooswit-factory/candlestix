@@ -121,7 +121,7 @@ describe("checkAgentNameAllowed — R17 layered on validateAgentNameSyntax, not 
 
   test("the reserved list is exactly the whole action-set vocabulary (R17's superset ruling)", () => {
     expect(new Set(RESERVED_AGENT_NAMES)).toEqual(
-      new Set(["create", "attach", "on", "off", "rename", "name", "archive", "unarchive", "delete", "list"])
+      new Set(["create", "attach", "on", "off", "rename", "name", "archive", "unarchive", "delete", "list", "open-terminal"])
     );
   });
 
