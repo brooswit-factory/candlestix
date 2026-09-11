@@ -35,8 +35,9 @@ what was wrong). An empty or whitespace-only `job` is refused
 Unix socket.** The eight-verb lifecycle action set, `attach-target` (R18's
 query), and the `open-terminal` seam are all reachable over HTTP-over-a-
 Unix-domain-socket — see "The daemon API" below for the transport
-reasoning, the route table, and the demonstration. The CLI (CNDLX-28) is
-being built in parallel against this exact contract; the webapp (CNDLX-16)
+reasoning, the route table, and the demonstration. The `candlestix` CLI
+(CNDLX-28/CNDLX-31) is a real, working thin client of this exact
+contract now — see "The candlestix CLI" below; the webapp (CNDLX-16)
 comes after. `open-terminal` itself is still an honest seam — CNDLX-3
 implements actually opening a window.
 
@@ -52,10 +53,22 @@ name-keyed per-agent MCP config) are deleted, not merely unused; see
 
 The full eight-verb lifecycle action set (`create`/`on`/`off`/`rename`/
 `archive`/`unarchive`/`delete`/`list`, `src/agent-actions.ts`) has two
-consumers now: the reconcile loop reads exactly the state these verbs
-write, and the daemon API (`src/api/`) is the one process that calls them
-to mutate it. Still deliberately absent: no CLI, no webapp (CNDLX-28/16),
-no real `open-terminal` implementation (CNDLX-3).
+consumers: the reconcile loop reads exactly the state these verbs write,
+and the daemon API (`src/api/`) is the one process that calls them to
+mutate it.
+
+**CNDLX-31 lands: the `candlestix` CLI now speaks the real, merged daemon
+API contract.** CNDLX-30 (a predecessor task) added the CLI — grammar, a
+thin HTTP-over-Unix-socket client, in-place attach, a confirming delete,
+exit codes — built against a temporary, local restatement of CNDLX-27's
+contract (`src/api-contract.ts`) because CNDLX-27 had not merged yet. That
+temporary file is now gone; the CLI imports `src/api/contract.ts`, the
+real, merged contract module, directly — including its `apiSocketPath`
+resolver, so the CLI and the daemon it talks to derive the socket path
+from the same function. See "The candlestix CLI" below for what shipped
+and the real end-to-end demonstration against a real daemon and a real
+`claude --bg` session. No webapp yet (CNDLX-16); the daemon-opens-a-window
+form of attach is still not built (CNDLX-3).
 
 ## Health (`src/health/`)
 
@@ -739,7 +752,9 @@ fabricating health) and is **not** evidence about attach-target, which
 does not consult pid liveness at all — only that a live `claude agents
 --json` entry exists under the agent's directory, which the stub does
 provide honestly. The real-session case (a genuine `claude --bg` process
-staying alive) is CNDLX-28's to demonstrate, not this task's.
+staying alive) is demonstrated for real by CNDLX-31 — see "The real
+end-to-end demonstration" under "The candlestix CLI" below — not by this
+section's own, deliberately stubbed run.
 
 **Host confirmed back at baseline** after this demonstration: all three
 demo daemon processes stopped (`ps aux` checked — the two other
@@ -995,9 +1010,11 @@ above: the eight verbs — `create`, `on`, `off`, `rename`, `archive`,
 CNDLX-19, the state these verbs write is exactly what the reconcile loop
 reads** — see "Supervisor loop" above. **As of CNDLX-32, these are also
 exactly the functions the daemon API calls** — see "The daemon API"
-below. Still no CLI, no webapp (CNDLX-28/16's scope), and the CLI's
-in-place `attach` is still not built (also CNDLX-28's) — though R18's
-`attach-target` query and the `open-terminal` seam both are, see below.
+below. **As of CNDLX-30/CNDLX-31, the `candlestix` CLI is a thin client of
+that same API**, including a real, working in-place `attach` (see "The
+candlestix CLI" below) — R18's `attach-target` query and the
+`open-terminal` seam are both built too, see below. No webapp yet
+(CNDLX-16's scope).
 
 - **`agent-lifecycle.ts`** — the PURE transition rules (R9): `decideOn`/
   `decideOff`/`decideArchive`/`decideUnarchive`/`decideDelete`, each a
@@ -1235,9 +1252,28 @@ both to the pure decision.
 attach-target is a read-only query; handing the same target to two
 simultaneous callers is not a conflict to resolve. The terminal is the
 caller's concern (R18) — what two simultaneous `claude attach` clients
-actually do is Claude Code's own behaviour, measured by CNDLX-28, not
-this task. Unlike the mutating verbs below, attach-target is **not**
-run through the mutation queue.
+actually do is Claude Code's own behaviour. Unlike the mutating verbs
+below, attach-target is **not** run through the mutation queue.
+
+**Measured for real (CNDLX-31): two simultaneous `candlestix <agent>`
+attaches, each through its own real pseudo-terminal, to the same live
+`claude --bg` session — no harm observed.** Both terminals rendered the
+same shared session view; a message typed in terminal A and a message
+typed in terminal B were both processed in order, and both terminals'
+own screens showed both exchanges (proof the two attaches are two windows
+onto one shared session, not two independent forks of it). Detaching
+terminal A (`Ctrl+Z`, exit `0`) left terminal B fully functional — a
+further message typed in B afterward was answered normally. `claude
+agents --json`, read independently after the whole measurement, showed
+the same session id and pid throughout, `status: "idle"`, never a
+crash or a second process. `claude logs <id>`, read independently, showed
+every probe word from both terminals present exactly once each, in
+order — no lost or corrupted turn. **Conclusion: candlestix's "do not
+lock or arbitrate" ruling is safe as measured.** No lock was invented.
+The falsifier that would have stopped this task and escalated to the
+epic — a corrupted session, a lost conversation turn, or one client
+silently killing the other — was not observed. See the PR description
+for the full transcript.
 
 ### `open-terminal` — the honest seam for CNDLX-3 (`src/open-terminal.ts`)
 
@@ -1305,6 +1341,355 @@ list, rename, off/no-change, archive, attach-target, unarchive, delete)
 driven entirely through `curl --unix-socket` against a foreground daemon
 with scratch XDG dirs.
 
+## The candlestix CLI (`src/cli/`)
+
+CNDLX-30 built the human-facing surface; CNDLX-31 rebased it onto CNDLX-27's
+real, merged daemon API and ran the real end-to-end demonstration below.
+**`candlestix` is a thin client of the daemon API — it never touches the
+store, the agent set, or any action/lifecycle module directly.** Every
+state-changing thing it does goes out over HTTP, on a Unix domain socket,
+to the daemon. A reviewer can check this by grep: nothing under `src/cli/`
+imports `agent-actions.ts`, `agent-set.ts`, `agent-set-store.ts`,
+`agent-resolver.ts`, `agent-session.ts`, `agent-spawn.ts`,
+`agent-directory.ts` or `agent-id.ts` — the one exception, `src/agent.ts`'s
+`AgentRecord` **type**, is imported type-only (via the contract module's own
+re-export), for the wire shape, never as a runtime value.
+
+### The real contract module (`src/api/contract.ts`) — the swap CNDLX-31 made
+
+CNDLX-30 was built while CNDLX-27's daemon API did not yet exist, against a
+**temporary, local restatement** of the contract it was promised
+(`src/api-contract.ts`: a guessed socket-path resolver, the route table, and
+the wire envelope/success types — none of it verified against a real server,
+because none existed yet). **CNDLX-31 deleted that file outright** once
+CNDLX-27 merged, and repointed every CLI import at `src/api/contract.ts` —
+CNDLX-27's real, merged contract module, which itself re-exports the socket
+resolver from `src/paths.ts` and the wire *response* types directly from the
+action set's own result unions (`agent-actions.ts`, `attach-target.ts`,
+`open-terminal.ts`), rather than restating them. Only the route table
+(`API_ROUTES`) and the request-body types are genuinely new to the contract
+module; the CLI's own `src/cli/api-client.ts` builds every path it calls from
+`API_ROUTES`' templates rather than hand-writing path strings a second time.
+
+**THE SOCKET-PATH DEFECT, found before it ever shipped.** The provisional
+module built `<candlestix runtime dir>/candlestix.sock` — a filename it
+guessed — while the real resolver, `apiSocketPath()` (`src/paths.ts`, bound
+by the daemon in `src/index.ts`), builds `<candlestix runtime dir>/api.sock`.
+Had this swap only corrected the filename in place, the CLI would have kept
+its own second derivation of a path that must have exactly one — safe today,
+silently divergent the next time either side's XDG-input handling changed.
+**The fix imports `apiSocketPath` itself** (`src/cli/bin.ts`), so the CLI's
+resolver *is* the daemon's, not a copy of it. Proven by
+`test/unit/cli/socket-path.test.ts` with a reference-identity check
+(`toBe`, not `toEqual`) — a negative control reconstructs the deleted
+module's own derivation shape (same XDG inputs, the guessed
+`candlestix.sock` filename) to show the identity check is capable of
+failing, not vacuously true. The end-to-end demonstration below also shows
+the running CLI reach the real daemon's actual bound socket, independently
+of the unit test.
+
+**Field-name reconciliation.** `AttachTargetSuccess`'s shape was CNDLX-30's
+own flagged most-likely-wrong guess: the temporary module put `agentId`,
+`name`, `sessionShortId` and `sessionId` flat on the success body. The real
+`AttachTargetResult` (`src/attach-target.ts`) nests them under a `target`
+field and names the agent's name field `agentName`, not `name`
+(`{ ok: true, target: { agentId, agentName, sessionShortId, sessionId } }`).
+Every other field name and shape CNDLX-30 guessed at — `agent`, `agents`,
+`outcome.kind`, the R6 no-change shapes — matched what CNDLX-27 actually
+shipped exactly; verified by reading the merged action-set result types
+directly, not inferred from a passing test (a mismatch here renders
+`undefined` silently and no fake-server test would catch it on its own).
+
+### The grammar (`src/cli/grammar.ts`) — pure, and deliberately ignorant of names
+
+```
+candlestix                          create a blank agent
+candlestix --name foo [--job "..."]  create, naming it (job: create-only, R3)
+candlestix <id|name>                attach, in this terminal
+candlestix <id|name> on|off         start/stop the session
+candlestix <id|name> name <new>     rename (alias: "rename")
+candlestix <id|name> archive        stop and hide (kept)
+candlestix <id|name> unarchive      return to off
+candlestix <id|name> delete [-y|--yes]   the one destructive verb; confirms
+candlestix list [--archived]        the live set; archived hidden unless --archived
+```
+
+The parser knows exactly two top-level words of its own (`list`, `create`)
+and seven second-position verbs (`on`, `off`, `archive`, `unarchive`,
+`delete`, `name`/`rename`). **It carries no second copy of the action
+set's ten-word reserved-name list, and validates no name syntax at all** —
+both are `agent-lifecycle.ts`'s job, enforced once. `src/cli/grammar.ts`
+has **zero imports** (checked by its own test), which is the strongest
+available proof it cannot be consulting a second list. An id-or-name that
+happens to collide with a verb word (e.g. literally `candlestix on`) is
+simply passed through as an attach target; the daemon refuses it as
+not-found, because the action set can never let such a name exist.
+
+An unknown verb, a missing/extra argument, or a bare `--`/unrecognized
+flag-like token where a name is expected are all usage errors (exit `2`),
+never a guess.
+
+### The API client (`src/cli/api-client.ts`) — HTTP/1.1 + JSON over a Unix socket
+
+Uses `node:http`'s `socketPath` option (verified locally, against a
+`Bun.serve({unix, fetch})` fake server, on the only bun available on this
+host — **1.3.14, not the laptop's 1.3.11**; nothing here is known to need
+anything newer, but it was not possible to verify at the floor itself — see
+"Bun version" below). `{idOrName}` is URL-encoded as one path segment
+(tested with a name containing both a space and a slash).
+
+**Daemon-down, distinguished where cheap:** a connect failure is followed
+by a `stat` of the socket path itself. `node:http`'s Unix-socket error path
+was found, empirically, to collapse "no such file", "a file exists but
+nothing is listening" and "a file exists but isn't a socket at all" into
+the same generic connect error with no reliable `err.code` to switch on —
+so this client does the cheap thing instead of trusting that code. This is
+best-effort (the file's presence can change between the failed connect and
+the `stat`), not a guarantee.
+
+**Transport trouble is kept separate from an ordinary API refusal at every
+layer:** `unreachable` (no connection at all), `protocol-error` (a response
+came back that isn't the `{"ok": ...}` envelope the contract promises — not
+valid JSON, or valid JSON missing `"ok"`), and `ok` (a real envelope,
+`true` or `false`). Only a real `ok:false` is ever rendered as a refusal.
+
+### Rendering, exit-code classification, and the message-less-refusal fallback (`src/cli/render.ts`)
+
+**R8, applied here:** `error.message` is printed verbatim whenever present
+— never the CLI's own wording for a refusal. **The one guard this layer
+adds on top of that (a defensive guard, not expected to fire):** if a
+refusal arrives with no `message` at all, the CLI prints exactly one
+generic line naming the `kind` and saying the daemon sent no message,
+rather than inventing per-kind wording of its own. This is unit-tested
+(including a negative control: two different missing-message kinds render
+two different lines, proving it is not a fixed string). **It is expected
+NEVER to fire against CNDLX-27's real, merged server** — every error kind
+reachable at the wire is verified, both at compile time and at runtime
+(`src/error-wire-format.ts`, part of CNDLX-27's own suite), to carry a
+server-produced message. The end-to-end demonstration below shows no route
+reaches this fallback against the real daemon, with a stated falsifier. If
+it is ever observed to fire against a real daemon, that is a CNDLX-27
+defect to report, never something to quietly paper over here.
+
+**Exit-code classification (CNDLX-31, the epic's settled ruling) —
+`classifyRefusalExitCode`:** not every `ok:false` is the same kind of "no".
+A refusal (`already-archived`, `off`, `not-found`, a declined delete, ...)
+means the request was understood and declined — exit `1`. A **daemon-side
+failure** (`store-malformed`, `spawn-failed`, `session-lookup-failed`, ...)
+means the request was fine and the daemon itself broke — a script reading
+`1` there would wrongly conclude the request was rejected and not retry, so
+these exit `3` instead, the same code as daemon-unreachable. The `message`
+is still printed verbatim either way; only the exit code changes.
+Classified through the contract's own `statusForErrorKind(kind) >= 500`
+rather than a hand-written list of daemon-side kinds in the CLI — the same
+one-list discipline as R17, so a kind added to the daemon's union later
+lands on the right exit code with no CLI change. **The implementation trap,
+found reading the merged code and pinned by a test named after it:**
+`ERROR_STATUS[kind]` is `undefined` for a kind outside the table, and in
+JavaScript `undefined >= 500` is `false` — so the naive
+`status >= 500 ? EXIT_DAEMON_UNREACHABLE : EXIT_REFUSAL` silently sends an
+*unrecognised* kind (a newer daemon, an older CLI) to `EXIT_REFUSAL`, the
+exact opposite of the ruling. `classifyRefusalExitCode` checks
+`status === undefined` explicitly rather than relying on the comparison
+alone.
+
+R6's no-change diagonal renders distinctly from a real transition and from
+a refusal (`already off` vs. `turned off` vs. the refusal's own message,
+each asserted by its own test).
+
+### attach — in this terminal, end to end, no daemon round trip for the terminal itself (`src/cli/attach.ts`, `src/cli/attach-runner.ts`)
+
+1. `GET .../attach-target`. A refusal (off, archived, not-found, zero or
+   several live sessions) is printed verbatim and exits non-zero —
+   **never starts an off agent to attach to it** (R18).
+2. On success, the terminal is handed to `claude attach <sessionShortId>`
+   with stdin/stdout/stderr **inherited**, and the CLI process's own exit
+   status becomes **exactly** the child's — this is tested with a
+   deliberately chosen exit code (`3`) that collides with candlestix's own
+   `EXIT_DAEMON_UNREACHABLE`, to prove no translation or clamping happens.
+   Bun (like Node) has no `exec()`-style process-image replacement, so this
+   is a spawn-with-inherited-stdio followed by exact propagation — the
+   fallback the ticket itself sanctions when true in-place replacement
+   isn't available.
+3. **The non-TTY decision, made explicitly rather than left to hang:** if
+   either stdin or stdout is not a TTY, the hand-off refuses outright
+   (`EXIT_REFUSAL`) with a message saying both must be a TTY, and
+   `spawnAttach` is never invoked. This check happens **after** a
+   successful attach-target response, matching the ticket's own ordering
+   (resolve first, then decide about the terminal) — a `--cwd`-piped or
+   cron-triggered `candlestix <agent>` fails fast and clearly rather than
+   hanging on a `claude attach` that can never get real input.
+4. **Measured for real (CNDLX-31), against a real daemon and a real `claude --bg` session, through a real pseudo-terminal — see the PR description's end-to-end transcript for the falsifiers and independent checks:**
+   - `claude attach --help` on this host prints exactly: *"Open the background session in this terminal. ← returns to agent view, Ctrl+Z drops back to your shell. The session keeps running either way."*
+   - **Detach (Ctrl+Z) genuinely returns control to the shell while the session keeps running** — `candlestix <agent>` exits `0` (the child's own exit code, propagated exactly, per item 2 above), and an independent `claude agents --json` read immediately after shows the same session id and pid, `status: "idle"`.
+   - **Two simultaneous attaches to the same session are safe**, per the epic's own ruling that attach-target does not lock or arbitrate — see "Two-terminal attach" in "The daemon API" below for the measurement and what was and was not observed.
+
+### delete — confirms, never defaults to yes (`src/cli/confirm.ts`)
+
+The confirmation matrix, every branch unit-tested plus exercised end to end
+through `runCli` against a fake server:
+
+| stdin | `--yes`/`-y` | Result |
+|---|---|---|
+| TTY | no, answers "yes"/"y" (case-insensitive, trimmed) | proceeds |
+| TTY | no, answers anything else (including a bare Enter) | **declined**, exit `1`, daemon's `delete` route never called |
+| TTY | yes | proceeds, **without ever prompting** |
+| not a TTY | no | **refused outright**, exit `1`, message says to pass `--yes` — never prompts (a prompt here would hang forever) |
+| not a TTY | yes | proceeds, without any prompt |
+
+A bare Enter is deliberately **not** an affirmative. On a TTY without
+`--yes`, the CLI best-effort fetches the live list to show **which agent**
+(id and name, when it can find a match) in the prompt; if that lookup
+fails or finds nothing, it falls back to echoing back exactly what the
+operator typed. The confirmation itself is interaction that lives entirely
+in the CLI — the daemon's `delete` route is the destructive action itself
+and is asked to confirm nothing.
+
+### Exit codes — and EXACTLY where candlestix's own codes stop applying
+
+| Code | Meaning | Where it comes from |
+|---|---|---|
+| `0` | success (including an R6 no-change success, e.g. "already off") | candlestix |
+| `1` | **"candlestix asked and was told no"** — an ordinary refusal, the daemon's `error.message` verbatim; a CLI-side policy refusal (attach's non-TTY check); or delete's confirmation being **declined at the confirmation prompt** (an explicit "no", not a daemon refusal — see "delete" above) | candlestix |
+| `2` | a usage error (bad grammar) | candlestix |
+| `3` | **"the daemon could not serve the request"** — unreachable, its response could not be understood, **or a daemon-side failure** (the store, a session lookup/cleanup, or a directory/spawn operation broke; the request itself was fine) | candlestix |
+
+**Exit `1` is never a daemon-side failure, and exit `3` is never "the operator said no."** A daemon-side `ok:false` (e.g. `store-malformed`, `spawn-failed`) is classified to `3`, not `1`, precisely so a script can tell "retry later, this wasn't rejected" apart from "don't retry, this was declined." See "Rendering, exit-code classification..." above for the classification rule and the trap it was built to avoid.
+
+**These four codes govern ONLY the pre-attach path — including every
+attach-target refusal.** The instant `candlestix <id|name>` successfully
+hands the terminal to `claude attach`, the process's exit status becomes
+**`claude attach`'s own**, unmodified, for as long as that session runs —
+and that status can be *any* value, including `0`, `1`, `2` or `3` from the
+table above, by coincidence rather than by candlestix's choice. A script
+that needs to tell "candlestix refused before ever attaching" apart from
+"the attached session itself exited with N" has exactly one place to look:
+whether the command that ran was a bare `candlestix <id|name>` (attach) —
+if so, and it printed nothing on stderr from this table's own wording, the
+exit code is `claude attach`'s; every other form's exit code is always
+candlestix's own.
+
+### When the daemon is not running
+
+The CLI names the exact socket path it tried, whether that path currently
+has a file at it or not (see "The API client" above for how that
+distinction is drawn), and points at the real systemd **user** unit this
+repo ships, `systemd/candlestix.service` — never a unit name copied from a
+ticket or from an unrelated workspace's own `ENVIRONMENT.md` (which, on a
+shared host, may well describe a *different* daemon entirely). Since it is
+a user unit, checking it is `systemctl --user status candlestix.service`
+and `journalctl --user -u candlestix.service` — the **system-level**
+`journalctl -u candlestix.service` (no `--user`) prints `-- No entries --`
+here, silently, rather than an error.
+
+**The CLI never falls back to reading or writing the agent-set store
+directly** — a reviewer can confirm this by the same grep as "no CLI logic
+the API cannot express" above.
+
+### Installing it, and the operator runbook
+
+A `bin` entry (`package.json`'s `"bin": {"candlestix": "./src/cli/bin.ts"}`)
+points at `src/cli/bin.ts`, which carries its own `#!/usr/bin/env bun`
+shebang — verified locally (this story) to run directly when made
+executable, with no bundling step required, since bun executes TypeScript
+source natively. Nothing in the CLI was found to need any Bun/Node API
+newer than what CNDLX-17/18 already relied on elsewhere in this tree
+(`node:http`, `node:fs/promises`, `node:readline/promises`, `Bun.spawn`) —
+each was checked to exist in Bun's own documented history at or before
+1.3.11, though (see "Bun version" below) the floor itself could not be
+run locally to confirm.
+
+**Getting from today's laptop state to a working `candlestix`, for the
+human — this has NOT been run on the laptop, and nobody should read it as
+having been.** (CNDLX-31 ran the equivalent sequence for real, but on a
+scratch host with scratch XDG dirs and a foreground daemon, never the
+installed unit or the laptop itself — see "The real end-to-end
+demonstration" below for what WAS actually run.)
+
+1. `cd ~/code/brooswit-factory/candlestix && git pull` (or wherever the
+   canonical checkout lives) to pick up this change once merged.
+2. `bun install --frozen-lockfile`.
+3. Restart the daemon's user unit so it starts serving the real,
+   merged API: `systemctl --user restart candlestix.service`.
+4. Put `candlestix` on `PATH`. Two ways that don't require root: `bun link`
+   from the repo (creates a global bun-managed symlink), or a manual
+   symlink of your own choosing, e.g.
+   `ln -s ~/code/brooswit-factory/candlestix/src/cli/bin.ts ~/.local/bin/candlestix`
+   (make sure `~/.local/bin` is on `PATH`, and that the target file is
+   executable — `chmod +x`).
+5. `candlestix` (bare) should create a blank agent and print the exact
+   attach command. **Unrun on the laptop itself** — nobody should read
+   this runbook as having been executed there — but this exact sequence
+   of effects (create, attach, off survives a daemon restart, archive,
+   delete) was run for real, end to end, against a real daemon and a
+   real `claude --bg` session on a scratch host; see the PR description's
+   transcript and "The real end-to-end demonstration" below.
+
+### The real end-to-end demonstration (CNDLX-31)
+
+Run against a **foreground** daemon (`bun run src/index.ts`, never the
+installed unit) with **scratch** `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/
+`XDG_RUNTIME_DIR` under a short-lived `/tmp` directory (kept short — see
+the sockaddr_un note below), driven entirely by the real CLI (`bun
+src/cli/bin.ts ...`) and a real `claude --bg` session, attached through a
+real pseudo-terminal. The full item-by-item transcript, each item with a
+falsifier stated before it ran and an independent check (never the CLI's
+own say-so — the durable store read directly, `claude agents --json`,
+`claude logs`, `stat`), is in the PR description; this section records
+only what it found:
+
+- **The CLI reached the real daemon's actual bound socket**, not merely
+  *some* socket: `apiSocketPath()` called from the CLI's own process
+  printed the byte-identical path the daemon's own startup log recorded
+  as what it bound, and every create/list/rename/etc. call's effect
+  showed up in the daemon's own durable store file and in `claude
+  agents --json`, both read independently of the CLI.
+- **Every item in the ticket's checklist passed**: create; attach with a
+  typed message independently confirmed in the session's own `claude
+  logs`; detach with the session independently confirmed still running;
+  rename with the directory's inode independently confirmed unchanged;
+  off, then R6's no-change on repeat off (`turned off` vs `already off`,
+  both exit `0`); off surviving a real daemon restart (SIGTERM, a fresh
+  process, one reconcile cycle) with **zero** new sessions, independently
+  checked (a **positive control** elsewhere in the same run — `on`
+  genuinely spawning a session — rules out "the loop is just broken and
+  never spawns anything"); on; archive hiding the agent from `list` while
+  `--archived` shows it, proven with a **second, still-`on` control
+  agent** so "empty list" cannot be mistaken for "list is just broken";
+  attach refused while archived and while off (verbatim messages, exit
+  `1`, and the off agent's store record independently confirmed to stay
+  `off` — never silently started); delete refused without `--yes` on a
+  non-TTY (directory independently confirmed still present) then deleting
+  with `--yes` (directory independently confirmed gone, id retired); the
+  two-terminal measurement (above).
+- **The message-less-refusal fallback never fired** — `grep`, over the
+  entire transcript, for its own telltale wording ("sent no message")
+  found zero matches.
+- **No stray session was left behind.** A final, unfiltered
+  `claude agents --json` (no `--cwd` — the whole Unix user's sessions,
+  including this host's live fleet of other agents' work) found 16
+  sessions total and confirmed, as the **negative control**, that zero of
+  them had a `cwd` under this run's scratch directory.
+- **Two probe bugs were found and fixed during this run, neither a
+  product defect** — named here per this project's own standing
+  practice of debugging the probe before filing a surprising result: (1)
+  an early independent-session check built the agent's directory path by
+  stripping the `@` from its id (mimicking `agent-spawn.ts`'s *systemd
+  unit name*, which does strip it — a different string with a different
+  purpose); `agentDirectoryPath` does not, so the check found zero
+  sessions where a real one existed until the path was corrected and
+  re-run. (2) several early exit-code assertions captured `$?` after
+  piping the command through `tee`, which captures `tee`'s exit code, not
+  the CLI's; re-run without the pipe (or reading `$?` before any further
+  command), every exit code matched what the unit tests already predicted.
+- **`sockaddr_un` length**, per the epic's own recorded artifact: the
+  scratch runtime directory was kept short (a plain `mktemp -d` under
+  `/tmp`, not nested under this task's own deep workspace path) —
+  measured at 47 bytes for the full socket path, comfortably under the
+  ~108-byte limit; never needed the relative-path fallback the epic's
+  note describes, but the margin was checked before relying on it, not
+  assumed.
+
 ## H1/H2/H3 — CNDLX-18's three handoff findings, each explicitly handled
 
 CNDLX-18 surfaced these during its own work, judged each out of its own
@@ -1338,10 +1723,14 @@ addressed here, explicitly, per this story's own acceptance criteria:
 
 ## Known gaps — stated plainly, not implied away
 
-- **No candlestix-specific attach convenience.** `claude attach <id>` /
-  `logs <id>` / `stop <id>` work today against any agent candlestix
-  spawned; a `candlestix`-side command that translates an agent's name to
-  its current session id is a real, separate seam CNDLX-15 builds.
+- **The CLI's in-place attach is built AND verified against a real daemon
+  — this bullet used to say "not built", then "resolves via a currently
+  fake daemon query pending CNDLX-27", and is corrected here rather than
+  left stale a second time.** `candlestix <id|name>` resolves through the
+  real, merged `attach-target` query and hands the terminal to `claude
+  attach <sessionShortId>`, both proven against a real daemon and a real
+  `claude --bg` session (CNDLX-31 — see "The real end-to-end
+  demonstration" above). Nothing about attach remains simulated.
 - **Argv-drift correctness on wake is out of scope** (a separate epic).
   Not observed to be broken during this or prior stories' own testing, but
   candlestix does not defend against or detect drift if it ever occurs.
@@ -1369,38 +1758,27 @@ addressed here, explicitly, per this story's own acceptance criteria:
   used to say the opposite and is corrected here rather than left stale.**
   `src/index.ts`/`src/supervisor.ts` read the durable agent set every
   cycle; see "Supervisor loop" above.
-- **`attach-target` is built (CNDLX-32); the CLI's in-place attach is
-  not.** `src/attach-target.ts` is R18's one query — resolve
-  `<id-or-name>`, decide whether it is attachable right now, return the
-  live session identity. What actually execs into a terminal in place is
-  CNDLX-28's (the CLI), still to come. `open-terminal` (the daemon-opens-
-  a-window path) is a seam, honestly: it runs the identical query, then an
-  honest `not-implemented` naming CNDLX-3, which builds the real thing.
-- **No CLI, no webapp** call any of this yet — CNDLX-28 and CNDLX-16's
-  scope. The daemon HTTP API itself is built (CNDLX-32) — see "The daemon
-  API" above.
+- **`attach-target` and `open-terminal` are built and merged (CNDLX-32/33,
+  `src/api/`).** R18's one query — resolve `<id-or-name>`, decide whether
+  it is attachable right now, return the live session identity —
+  including its short id. `open-terminal` runs the identical query, then
+  an honest `not-implemented` naming CNDLX-3, which builds the real
+  window-opening thing. The CLI's in-place attach (CNDLX-30/31) execs
+  `claude attach <sessionShortId>` against this real query.
+- **No webapp yet** — CNDLX-16's scope.
 - **How an operator adds an MCP server to a daemon-created agent is
   unowned by any current story.** S6 gives every daemon-created agent an
   empty MCP config and keeps `--strict-mcp-config`; no verb or surface
   configures it yet. Deliberately not this task's either — CNDLX-26.
-- **Bun version (CNDLX-20, resolved by this task):** `engines.bun` is now
+- **Bun version (CNDLX-20, resolved by CNDLX-27):** `engines.bun` is
   `>=1.3.11`, matching the target laptop, with a CI job (`check-floor` in
   `.github/workflows/ci.yml`) pinned to exactly `1.3.11` alongside the
-  existing `latest` job — both run typecheck, test, and build. This task's
-  own suite, typecheck, and build were run against a REAL bun 1.3.11,
-  installed into a scratch directory inside this task's own workspace by
-  bun's own installer (an install directory + version tag, leaving the
-  shared `bun` on `PATH` untouched) and invoked by full path — see the PR
-  description for `<scratch>/bin/bun --version` printing `1.3.11`
-  immediately beside that run. Nothing added by this task uses any Bun API
-  not already verified to exist at 1.3.11 (`Bun.serve({unix})`,
-  `fetch(url, {unix})`, and `Bun.connect({unix})` were each checked
-  directly against a real 1.3.11 binary before being relied on).
+  existing `latest` job — both run typecheck, test, and build.
 - **Two attaches at once is correct, and candlestix does not arbitrate
   it** (see "The daemon API" above) — recorded here too since it reads
   like a gap at a glance and is in fact a deliberate ruling: what two
   simultaneous `claude attach` clients actually do is Claude Code's own
-  behaviour, measured by CNDLX-28, not this task.
+  behaviour, measured by CNDLX-31 below.
 - **CNDLX-33's `invalid-job` refusal is enforced at `createAgent`
   (create-time), not at `spawnDaemonAgent` (every spawn).** R3 says `job`
   is set at create-only and nothing in this codebase mutates it after
@@ -1409,10 +1787,9 @@ addressed here, explicitly, per this story's own acceptance criteria:
   (`agent-set.ts`) still accepts any string for `job`, including `""`, so
   a hand-edited `agents.json`, or a record created before this fix
   shipped, could still hold `job: ""` and would still reach spawn as
-  `--append-system-prompt ""` the next time `turnOn` re-spawns it. Out of
-  scope for this task, which is about the wire-reachable create defect
-  the epic named — flagged here rather than silently left for a future
-  reader to rediscover.
+  `--append-system-prompt ""` the next time `turnOn` re-spawns it. Filed
+  as CNDLX-34, destination CNDLX-2 (spawn-argv correctness) — not this
+  task's to fix.
 
 ## Tooling
 

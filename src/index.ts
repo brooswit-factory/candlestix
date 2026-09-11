@@ -54,7 +54,7 @@ async function warnIfLegacyRosterExists(): Promise<void> {
   if (await pathExists(path)) {
     log(
       "warn",
-      `legacy roster file found at "${path}" — it is NO LONGER READ. Agents are now created and managed entirely through candlestix's own daemon-owned agent set (create/on/off/rename/archive/unarchive/delete — see agent-actions.ts), reachable over the daemon's own HTTP-over-Unix-socket API (see api/server.ts, CNDLX-32) — no CLI yet (CNDLX-28, in progress). This file will never be consulted again; delete it or leave it in place, either is safe, but editing it will have no effect.`
+      `legacy roster file found at "${path}" — it is NO LONGER READ. Agents are now created and managed entirely through candlestix's own daemon-owned agent set (create/on/off/rename/archive/unarchive/delete — see agent-actions.ts), reachable over the daemon's own HTTP-over-Unix-socket API (see api/server.ts, CNDLX-32) and the \`candlestix\` CLI (CNDLX-28/CNDLX-31, a thin client of that same API). This file will never be consulted again; delete it or leave it in place, either is safe, but editing it will have no effect.`
     );
   }
 }
