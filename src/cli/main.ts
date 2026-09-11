@@ -136,7 +136,7 @@ async function handleAttach(command: Extract<ParsedCommand, { kind: "attach" }>,
   const body = result.body;
   if (!body.ok) return renderRefusal(body.error);
 
-  const handoff = await performAttachHandoff(body.sessionShortId, {
+  const handoff = await performAttachHandoff(body.target.sessionShortId, {
     stdinIsTTY: deps.io.stdinIsTTY,
     stdoutIsTTY: deps.io.stdoutIsTTY,
     spawnAttach: deps.io.spawnAttach,

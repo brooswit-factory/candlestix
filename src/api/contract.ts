@@ -1,8 +1,8 @@
-// CNDLX-27 section 2 / CNDLX-32: THE contract module. CNDLX-28 (the CLI,
-// built in parallel against this exact file) imports the socket-path
-// resolver, the route table, and the wire types from HERE rather than each
-// side restating them — so the two surfaces cannot disagree about where
-// the socket is, what routes exist, or what a response body looks like.
+// CNDLX-27 section 2 / CNDLX-32: THE contract module. The `candlestix` CLI
+// (CNDLX-28/CNDLX-31) imports the socket-path resolver, the route table,
+// and the wire types from HERE rather than restating them — so the two
+// surfaces cannot disagree about where the socket is, what routes exist,
+// or what a response body looks like.
 //
 // Per CNDLX-27's doc: "the response body is authoritative and is the
 // action's own result union, serialized as-is" — so the wire *response*

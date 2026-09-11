@@ -1,8 +1,18 @@
 // Exit codes for the candlestix CLI's OWN pre-attach path.
 //
-// These four codes are the epic's accepted default, and this story uses
-// them without deviation: 0 success, 1 refusal, 2 usage error, 3 daemon
-// unreachable.
+// These four codes are the epic's accepted default: 0 success, 1 refusal,
+// 2 usage error, 3 daemon unreachable/unintelligible.
+//
+// EXIT_REFUSAL's exact meaning, settled by the epic (CNDLX-31): "candlestix
+// asked and was told no" — an ordinary refusal, including a delete the
+// operator declined at the confirmation prompt. It does NOT cover every
+// `ok:false` from the daemon: a daemon-SIDE failure (the store, a session
+// lookup, spawning) means the request was fine and the daemon broke, so it
+// exits EXIT_DAEMON_UNREACHABLE instead — a script reading `1` there would
+// wrongly conclude the request was rejected and not retry. See
+// src/cli/render.ts's `classifyRefusalExitCode`, which does this
+// classification through the contract's own `statusForErrorKind` rather
+// than a hand-written kind list here.
 //
 // CRITICAL BOUNDARY, stated here because every caller of these constants
 // needs to know it: these codes govern ONLY the pre-attach path, including

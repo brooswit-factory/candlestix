@@ -1,8 +1,10 @@
 // The CLI's thin HTTP-over-Unix-socket client. Speaks HTTP/1.1 with JSON
-// bodies to the daemon's socket (CNDLX-27's contract, restated in
-// src/api-contract.ts). Never touches the store, never imports an
-// action/store module for anything but a type — this file's only import
-// from core is api-contract.ts, which itself only type-imports AgentRecord.
+// bodies to the daemon's socket, against CNDLX-27's real, merged contract
+// module (src/api/contract.ts) — imported directly, never restated. This
+// file's only imports from core are type-only (the contract module's own
+// re-exports of the action set's result types) plus the route table and
+// the socket-path resolver, both re-exported by the same module so the CLI
+// and the daemon cannot derive either one differently.
 //
 // Uses `node:http`'s `socketPath` option rather than `Bun.fetch`'s `unix`
 // option: both exist at the locally available bun (1.3.14); `node:http` is
@@ -26,19 +28,46 @@
 import * as http from "node:http";
 import { stat } from "node:fs/promises";
 import {
-  AGENTS_COLLECTION_PATH,
-  agentActionPath,
-  agentAttachTargetPath,
-  agentRenamePath,
-  type AttachTargetEnvelope,
-  type CreateAgentBody,
-  type CreateAgentEnvelope,
-  type LifecycleAction,
-  type LifecycleActionEnvelope,
-  type ListAgentsEnvelope,
-  type RenameAgentBody,
-  type RenameAgentEnvelope,
-} from "../api-contract";
+  API_ROUTES,
+  type ApiRouteName,
+  type ArchiveAgentResult,
+  type AttachTargetResult,
+  type CreateAgentRequestBody,
+  type CreateAgentResult,
+  type DeleteAgentResult,
+  type ListAgentsResult,
+  type OffAgentResult,
+  type OnAgentResult,
+  type RenameAgentRequestBody,
+  type RenameAgentResult,
+  type UnarchiveAgentResult,
+} from "../api/contract";
+
+/**
+ * The five lifecycle verbs share one wire shape (`{ok:true;outcome:{kind}}`
+ * — R6's no-change diagonal is one such `kind`), but each is still its own
+ * named result type in the action set (so a server-side caller gets a
+ * precise type). The CLI only ever reads `outcome.kind` as an opaque
+ * string (src/cli/main.ts's `renderLifecycleOutcome`), so a plain union of
+ * the five real result types — never a restated shape — is exactly enough.
+ */
+export type LifecycleActionResult = OnAgentResult | OffAgentResult | ArchiveAgentResult | UnarchiveAgentResult | DeleteAgentResult;
+
+/** The CLI's own five lifecycle verb names, mapped to the contract's route names — a mechanical address translation, not a second copy of what each route DOES (that stays `API_ROUTES`' job, imported, never restated). */
+export type LifecycleAction = "on" | "off" | "archive" | "unarchive" | "delete";
+const LIFECYCLE_ROUTES: Record<LifecycleAction, ApiRouteName> = {
+  on: "turnOn",
+  off: "turnOff",
+  archive: "archiveAgent",
+  unarchive: "unarchiveAgent",
+  delete: "deleteAgent",
+};
+
+/** `{idOrName}` is one URL-encoded path segment, substituted into `API_ROUTES`' own template — the one place every route this client calls is built. */
+function routePath(route: ApiRouteName, idOrName?: string): string {
+  const template = API_ROUTES[route].pathTemplate;
+  return idOrName === undefined ? template : template.replace(":idOrName", encodeURIComponent(idOrName));
+}
 
 export interface TransportUnreachable {
   transport: "unreachable";
@@ -140,14 +169,15 @@ async function call<T>(method: string, path: string, jsonBody: unknown | undefin
 
 export function createApiClient(deps: ApiClientDeps) {
   return {
-    createAgent: (body: CreateAgentBody): Promise<CallResult<CreateAgentEnvelope>> => call("POST", AGENTS_COLLECTION_PATH, body, deps),
-    listAgents: (): Promise<CallResult<ListAgentsEnvelope>> => call("GET", AGENTS_COLLECTION_PATH, undefined, deps),
-    lifecycleAction: (idOrName: string, action: LifecycleAction): Promise<CallResult<LifecycleActionEnvelope>> =>
-      call("POST", agentActionPath(idOrName, action), undefined, deps),
-    renameAgent: (idOrName: string, body: RenameAgentBody): Promise<CallResult<RenameAgentEnvelope>> =>
-      call("POST", agentRenamePath(idOrName), body, deps),
-    attachTarget: (idOrName: string): Promise<CallResult<AttachTargetEnvelope>> =>
-      call("GET", agentAttachTargetPath(idOrName), undefined, deps),
+    createAgent: (body: CreateAgentRequestBody): Promise<CallResult<CreateAgentResult>> =>
+      call("POST", routePath("createAgent"), body, deps),
+    listAgents: (): Promise<CallResult<ListAgentsResult>> => call("GET", routePath("listAgents"), undefined, deps),
+    lifecycleAction: (idOrName: string, action: LifecycleAction): Promise<CallResult<LifecycleActionResult>> =>
+      call("POST", routePath(LIFECYCLE_ROUTES[action], idOrName), undefined, deps),
+    renameAgent: (idOrName: string, body: RenameAgentRequestBody): Promise<CallResult<RenameAgentResult>> =>
+      call("POST", routePath("renameAgent", idOrName), body, deps),
+    attachTarget: (idOrName: string): Promise<CallResult<AttachTargetResult>> =>
+      call("GET", routePath("attachTarget", idOrName), undefined, deps),
   };
 }
 

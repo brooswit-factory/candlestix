@@ -76,7 +76,7 @@ describe("createApiClient — the happy path, one per route", () => {
     const server = await startFakeServer((req) => {
       expect(req.method).toBe("GET");
       expect(req.path).toBe("/v1/agents/my-agent/attach-target");
-      return { body: { ok: true, agentId: "@abc", sessionShortId: "sess1", sessionId: "sess1-full" } };
+      return { body: { ok: true, target: { agentId: "@abc", agentName: undefined, sessionShortId: "sess1", sessionId: "sess1-full" } } };
     });
     try {
       const client = createApiClient({ socketPath: server.socketPath });

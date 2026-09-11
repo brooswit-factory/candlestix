@@ -1,8 +1,9 @@
 // CNDLX-23: the eight-verb action set, as plain callable functions.
 // CNDLX-32 (this file's only caller besides the reconcile loop, plus
-// src/api/server.ts) exposes these over a daemon HTTP API; no CLI, no
-// webapp yet — those are CNDLX-28/CNDLX-16's. `attach` (the exec-in-place
-// verb) is deliberately NOT here — it is CNDLX-28's; `attach-target` (R18's
+// src/api/server.ts) exposes these over a daemon HTTP API; the
+// `candlestix` CLI (CNDLX-28/CNDLX-31) is a thin client of that API — no
+// webapp yet (CNDLX-16's). `attach` (the exec-in-place verb) is
+// deliberately NOT here — it is the CLI's; `attach-target` (R18's
 // query) lives in attach-target.ts instead, and `open-terminal`
 // (open-terminal.ts) is a seam for CNDLX-3.
 //
