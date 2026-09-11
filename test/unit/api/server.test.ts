@@ -261,6 +261,228 @@ describe("handleRequest — routing and body validation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// CNDLX-33 defect 2: a create/rename body that is valid JSON but not an
+// object-shaped-as-expected must be `invalid-request-body`, 400 — never a
+// silent create/rename. Every row is the epic's own repro table, including
+// its control, plus a check that a REJECTED create spawns nothing at all
+// (asserted on recorded commands, never inferred from the status code).
+// ---------------------------------------------------------------------------
+
+describe("CNDLX-33 defect 2 — create body is empty-or-object with keys ⊆ {name, job}", () => {
+  const badCreateBodies: Array<{ label: string; body: string }> = [
+    { label: "a bare string", body: JSON.stringify("x") },
+    { label: "a bare number", body: JSON.stringify(42) },
+    { label: "an array", body: JSON.stringify([]) },
+    { label: "null", body: JSON.stringify(null) },
+  ];
+
+  for (const { label, body } of badCreateBodies) {
+    test(`${label} is refused as invalid-request-body, 400, and spawns nothing — fails if status is 200 or a systemd-run command is recorded`, async () => {
+      await withHarness(async ({ deps, commands }) => {
+        const queue = createMutationQueue();
+        const res = await handleRequest(new Request("http://localhost/v1/agents", { method: "POST", body }), deps, queue);
+        expect(res.status).toBe(statusForErrorKind("invalid-request-body"));
+        const parsed = await readJson(res);
+        expect(parsed).toEqual({ ok: false, error: { kind: "invalid-request-body", message: expect.any(String) } });
+        expect(commands.find((c) => c[0] === "systemd-run")).toBeUndefined();
+
+        const list = await readJson(await handleRequest(new Request("http://localhost/v1/agents"), deps, queue));
+        expect(list.agents).toHaveLength(0);
+      });
+    });
+  }
+
+  test("an unknown/misspelled key is refused, naming the key — fails if the create succeeds or the message doesn't mention \"nmae\"", async () => {
+    await withHarness(async ({ deps, commands }) => {
+      const queue = createMutationQueue();
+      const res = await handleRequest(
+        new Request("http://localhost/v1/agents", { method: "POST", body: JSON.stringify({ nmae: "typo" }) }),
+        deps,
+        queue
+      );
+      expect(res.status).toBe(statusForErrorKind("invalid-request-body"));
+      const body = await readJson(res);
+      expect(body.error.message).toContain("nmae");
+      expect(commands.find((c) => c[0] === "systemd-run")).toBeUndefined();
+    });
+  });
+
+  test("CONTROL: {name: string} is accepted, 200, and DOES spawn — proves the harness/probe can observe a real create, so the refusals above are not probe artifacts", async () => {
+    await withHarness(async ({ deps, commands }) => {
+      const queue = createMutationQueue();
+      const res = await handleRequest(
+        new Request("http://localhost/v1/agents", { method: "POST", body: JSON.stringify({ name: "good-name" }) }),
+        deps,
+        queue
+      );
+      expect(res.status).toBe(OK_STATUS);
+      const body = await readJson(res);
+      expect(body.ok).toBe(true);
+      expect(commands.find((c) => c[0] === "systemd-run")).toBeDefined();
+    });
+  });
+});
+
+describe("CNDLX-33 defect 2 — rename body is exactly {name}, the same object-shape check", () => {
+  const badRenameBodies: Array<{ label: string; body: string }> = [
+    { label: "a bare string", body: JSON.stringify("x") },
+    { label: "a bare number", body: JSON.stringify(42) },
+    { label: "an array", body: JSON.stringify([]) },
+    { label: "null", body: JSON.stringify(null) },
+    { label: "an unknown key", body: JSON.stringify({ mane: "typo" }) },
+  ];
+
+  for (const { label, body } of badRenameBodies) {
+    test(`${label} is refused as invalid-request-body, 400 — fails if the rename succeeds (status 200) or throws instead of returning a typed result`, async () => {
+      await withHarness(async ({ deps }) => {
+        const queue = createMutationQueue();
+        const create = await readJson(await handleRequest(new Request("http://localhost/v1/agents", { method: "POST", body: "{}" }), deps, queue));
+        const enc = encodeURIComponent(create.agent.id);
+        const res = await handleRequest(new Request(`http://localhost/v1/agents/${enc}/rename`, { method: "POST", body }), deps, queue);
+        expect(res.status).toBe(statusForErrorKind("invalid-request-body"));
+      });
+    });
+  }
+
+  test("CONTROL: {name: string} renames successfully", async () => {
+    await withHarness(async ({ deps }) => {
+      const queue = createMutationQueue();
+      const create = await readJson(await handleRequest(new Request("http://localhost/v1/agents", { method: "POST", body: "{}" }), deps, queue));
+      const enc = encodeURIComponent(create.agent.id);
+      const res = await handleRequest(
+        new Request(`http://localhost/v1/agents/${enc}/rename`, { method: "POST", body: JSON.stringify({ name: "renamed-ok" }) }),
+        deps,
+        queue
+      );
+      expect(res.status).toBe(OK_STATUS);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CNDLX-33 defect 1a: a malformed percent-escape in `{idOrName}` — over a
+// REAL socket, per the epic's own repro. Failure condition: status !== 400,
+// content-type isn't JSON, or the body isn't the typed malformed-path
+// shape (e.g. an HTML page, or a bare framework 500) means the defect is
+// still present. Control: the same route with a validly-escaped but
+// unknown idOrName still gets its normal typed 404.
+// ---------------------------------------------------------------------------
+
+describe("CNDLX-33 defect 1a — malformed percent-escape is typed JSON 400, never an HTML page (real socket)", () => {
+  async function withLiveSocket<T>(deps: AgentActionsDeps, fn: (socketPath: string) => Promise<T>): Promise<T> {
+    const dir = await mkdtemp(join(tmpdir(), "candlestix-api-malformed-path-"));
+    try {
+      const socketPath = join(dir, "api.sock");
+      const result = await startApiServer(deps, socketPath);
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("setup failed");
+      try {
+        return await fn(socketPath);
+      } finally {
+        result.handle.stop();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("GET .../%E0%A4%A/attach-target -> 400 malformed-path, JSON content-type, server-produced message", async () => {
+    await withHarness(async ({ deps }) => {
+      await withLiveSocket(deps, async (socketPath) => {
+        const res = await fetch("http://localhost/v1/agents/%E0%A4%A/attach-target", { unix: socketPath } as never);
+        expect(res.status).toBe(statusForErrorKind("malformed-path"));
+        expect(res.headers.get("content-type")).toContain("application/json");
+        const body = await res.json();
+        expect(body).toEqual({ ok: false, error: { kind: "malformed-path", message: expect.any(String) } });
+      });
+    });
+  });
+
+  test("POST .../%E0%A4%A/on -> 400 malformed-path (the mutating-route branch, not only GET)", async () => {
+    await withHarness(async ({ deps }) => {
+      await withLiveSocket(deps, async (socketPath) => {
+        const res = await fetch("http://localhost/v1/agents/%E0%A4%A/on", { method: "POST", unix: socketPath } as never);
+        expect(res.status).toBe(statusForErrorKind("malformed-path"));
+        const body = await readJson(res);
+        expect(body.error.kind).toBe("malformed-path");
+      });
+    });
+  });
+
+  test("CONTROL: a validly-escaped but unknown idOrName still gets the normal typed 404, not malformed-path", async () => {
+    await withHarness(async ({ deps }) => {
+      await withLiveSocket(deps, async (socketPath) => {
+        const res = await fetch(`http://localhost/v1/agents/${encodeURIComponent("@nope")}/attach-target`, { unix: socketPath } as never);
+        expect(res.status).toBe(statusForErrorKind("not-found"));
+        expect(res.headers.get("content-type")).toContain("application/json");
+        const body = await readJson(res);
+        expect(body.ok).toBe(false);
+        expect(body.error.kind).toBe("not-found");
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CNDLX-33 defect 1b: the catch-all. Any unexpected throw on the request
+// path — proven here with a genuinely injected throwing dependency, not a
+// path already caught by an existing typed error — becomes a typed JSON
+// 500, is logged server-side with the real detail, and NEVER leaks that
+// detail (or a stack trace) to the client. Failure condition: the response
+// contains the injected marker string, or nothing is logged, or the status
+// isn't 500/kind isn't internal-error.
+// ---------------------------------------------------------------------------
+
+describe("CNDLX-33 defect 1b — the catch-all turns any unexpected throw into typed JSON 500, never a stack trace to the client", () => {
+  const INJECTED_MARKER = "injected-boom-a7f3c9";
+
+  async function withConsoleSpy<T>(fn: (lines: string[]) => Promise<T>): Promise<T> {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    try {
+      return await fn(lines);
+    } finally {
+      console.log = original;
+    }
+  }
+
+  test("an injected throwing dependency becomes 500 internal-error, JSON, with the detail logged server-side but absent from the response", async () => {
+    await withHarness(async ({ deps }) => {
+      const queue = createMutationQueue();
+      const brokenDeps: AgentActionsDeps = {
+        ...deps,
+        mcpConfigPath: () => {
+          throw new Error(INJECTED_MARKER);
+        },
+      };
+      await withConsoleSpy(async (lines) => {
+        const res = await handleRequest(new Request("http://localhost/v1/agents", { method: "POST", body: "{}" }), brokenDeps, queue);
+        expect(res.status).toBe(statusForErrorKind("internal-error"));
+        expect(res.headers.get("content-type")).toContain("application/json");
+        const body = await readJson(res);
+        expect(body).toEqual({ ok: false, error: { kind: "internal-error", message: expect.any(String) } });
+        // Never leaked to the client:
+        expect(JSON.stringify(body)).not.toContain(INJECTED_MARKER);
+        expect(JSON.stringify(body).toLowerCase()).not.toContain("at ");    // a crude but real check for a stack-trace shape ("    at foo (file:line)")
+        // But it WAS logged server-side, with the real detail an operator needs:
+        expect(lines.some((l) => l.includes(INJECTED_MARKER) && l.includes("ERROR"))).toBe(true);
+      });
+    });
+  });
+
+  test("CONTROL: the identical request against the WORKING dependency still succeeds normally — proves the injected fault, not the harness, caused the 500 above", async () => {
+    await withHarness(async ({ deps }) => {
+      const queue = createMutationQueue();
+      const res = await handleRequest(new Request("http://localhost/v1/agents", { method: "POST", body: "{}" }), deps, queue);
+      expect(res.status).toBe(OK_STATUS);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Single-writer serialization, proven on the REAL dispatch path
 // (handleRequest) with a real temp-dir store — negative control: the same
 // concurrent requests through a NO-OP queue (no serialization at all) lose

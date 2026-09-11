@@ -80,6 +80,7 @@ export const ALL_WIRE_ERROR_KINDS = checkExhaustive([
   "invalid-name",
   "reserved-name",
   "name-taken",
+  "invalid-job",
   "directory-create-failed",
   "spawn-failed",
   "store-write-failed",
@@ -115,6 +116,7 @@ export function hasServerMessage(err: AnyActionError): boolean {
     case "invalid-name":
     case "reserved-name":
     case "name-taken":
+    case "invalid-job":
     case "directory-create-failed":
     case "spawn-failed":
     case "store-write-failed":

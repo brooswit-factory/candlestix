@@ -192,6 +192,7 @@ export type CreateAgentError =
   | { kind: "invalid-name"; message: string }
   | { kind: "reserved-name"; word: string; message: string }
   | { kind: "name-taken"; holder: AgentRecord; message: string }
+  | { kind: "invalid-job"; message: string }
   | DirectoryCreateTrouble
   | SpawnTrouble
   | StoreWriteTrouble;
@@ -218,6 +219,21 @@ export async function createAgent(deps: AgentActionsDeps, params: CreateAgentPar
         ? { ok: false, error: { kind: "invalid-name", message: nameCheck.error.message } }
         : { ok: false, error: { kind: "reserved-name", word: nameCheck.error.word, message: nameCheck.error.message } };
     }
+  }
+
+  // CNDLX-33 defect 3 / R3: `job` is create-only, and where it is ABSENT the
+  // `--append-system-prompt` flag is omitted entirely (agent-spawn.ts) —
+  // but an empty or whitespace-only string is PRESENT, not absent, and was
+  // reaching spawn as `--append-system-prompt ""`. Refused here (the epic's
+  // stated preference, R3's own reasoning: an operator who typed an empty
+  // job probably meant something, and saying so beats silently dropping it)
+  // rather than in the HTTP handler alone, so every direct `createAgent`
+  // caller — not only the wire path — gets the same guarantee.
+  if (params.job !== undefined && params.job.trim().length === 0) {
+    return {
+      ok: false,
+      error: { kind: "invalid-job", message: `"job" must not be empty or whitespace-only when present — omit it entirely instead` },
+    };
   }
 
   const id = mintAgentId({ now: deps.now, random: deps.random });

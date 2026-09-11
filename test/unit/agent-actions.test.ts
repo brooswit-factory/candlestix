@@ -613,6 +613,39 @@ describe("R11 — job is optional and never sent as an empty string", () => {
       expect(launch![idx + 1]).toBe("watch PRs");
     });
   });
+
+  // CNDLX-33 defect 3: an empty or whitespace-only `job` is PRESENT, not
+  // absent — before this fix it reached spawn as `--append-system-prompt
+  // ""`, violating R3. Fixed here in `createAgent` (agent-actions.ts, the
+  // core layer both the API and any direct caller go through), not in the
+  // HTTP handler alone — option (i), refuse it, per the epic's stated
+  // preference. Failure condition for each: a refused create with job:"" or
+  // job:"   " that still reaches `queue.run`/spawns a session (a
+  // `systemd-run` command recorded) means the defect is still present.
+  test("an empty job is REFUSED as invalid-job, and nothing is spawned", async () => {
+    await withHarness(async ({ deps, commands }) => {
+      const result = await createAgent(deps, { name: "empty-job", job: "" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("invalid-job");
+      expect(commands.find((c) => c[0] === "systemd-run")).toBeUndefined();
+    });
+  });
+
+  test("a whitespace-only job is REFUSED as invalid-job, and nothing is spawned", async () => {
+    await withHarness(async ({ deps, commands }) => {
+      const result = await createAgent(deps, { name: "whitespace-job", job: "   \t  " });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.kind).toBe("invalid-job");
+      expect(commands.find((c) => c[0] === "systemd-run")).toBeUndefined();
+    });
+  });
+
+  test("control: a real non-empty job is accepted and reaches spawn argv intact (see test above) — refusal is specific to empty/whitespace, not to `job` in general", async () => {
+    await withHarness(async ({ deps }) => {
+      const result = await createAgent(deps, { name: "real-job-control", job: "watch PRs" });
+      expect(result.ok).toBe(true);
+    });
+  });
 });
 
 describe("S6 — a daemon-created agent gets an EMPTY MCP config, keeping --strict-mcp-config", () => {
