@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { archiveAgent, createAgent, type AgentActionsDeps } from "../../src/agent-actions";
-import { attachTargetDepsFrom } from "../../src/attach-target";
+import { attachTargetDepsFrom, getAttachTarget } from "../../src/attach-target";
 import { getOpenTerminalTarget } from "../../src/open-terminal";
 import type { RunCommand } from "../../src/agents-cli";
 
@@ -54,45 +54,66 @@ async function withHarness<T>(fn: (h: Harness) => Promise<T>): Promise<T> {
 }
 
 describe("getOpenTerminalTarget — the seam for CNDLX-3", () => {
-  test("unknown id-or-name gets the IDENTICAL refusal attach-target would give", async () => {
+  test("unknown id-or-name gets the IDENTICAL refusal attach-target would give (byte-for-byte, not merely the same kind)", async () => {
     await withHarness(async ({ deps }) => {
       const attachDeps = attachTargetDepsFrom(deps);
-      const result = await getOpenTerminalTarget(attachDeps, "@nonexistent00000000");
-      expect(result.ok).toBe(false);
-      expect(result.error.kind).toBe("not-found");
+      const openResult = await getOpenTerminalTarget(attachDeps, "@nonexistent00000000");
+      const attachResult = await getAttachTarget(attachDeps, "@nonexistent00000000");
+      expect(openResult.ok).toBe(false);
+      expect(openResult.error.kind).toBe("not-found");
+      // The actual regression this guards against: a future open-terminal
+      // that re-implements attach-target's branches instead of delegating
+      // to it would still satisfy a `.kind`-only assertion while silently
+      // drifting on `query`/`message` wording — `toStrictEqual` against
+      // attach-target's own live result is what a hand-rolled copy could
+      // not pass by accident.
+      if (attachResult.ok) throw new Error("setup failed: attach-target unexpectedly succeeded");
+      expect(openResult).toStrictEqual(attachResult);
     });
   });
 
-  test("off agent gets attach-target's identical 'off' refusal, never a not-implemented", async () => {
+  test("off agent gets attach-target's identical 'off' refusal, never a not-implemented (byte-for-byte)", async () => {
     await withHarness(async ({ deps }) => {
       const created = await createAgent(deps, { name: "sleepy", initialState: "off" });
       if (!created.ok) throw new Error("setup failed");
-      const result = await getOpenTerminalTarget(attachTargetDepsFrom(deps), created.agent.id);
-      expect(result.ok).toBe(false);
-      expect(result.error.kind).toBe("off");
+      const attachDeps = attachTargetDepsFrom(deps);
+      const openResult = await getOpenTerminalTarget(attachDeps, created.agent.id);
+      const attachResult = await getAttachTarget(attachDeps, created.agent.id);
+      expect(openResult.ok).toBe(false);
+      expect(openResult.error.kind).toBe("off");
+      if (attachResult.ok) throw new Error("setup failed: attach-target unexpectedly succeeded");
+      expect(openResult).toStrictEqual(attachResult);
     });
   });
 
-  test("archived agent gets attach-target's identical 'archived' refusal", async () => {
+  test("archived agent gets attach-target's identical 'archived' refusal (byte-for-byte)", async () => {
     await withHarness(async ({ deps }) => {
       const created = await createAgent(deps, { name: "shelved", initialState: "off" });
       if (!created.ok) throw new Error("setup failed");
       const archived = await archiveAgent(deps, created.agent.id);
       expect(archived.ok).toBe(true);
-      const result = await getOpenTerminalTarget(attachTargetDepsFrom(deps), created.agent.id);
-      expect(result.ok).toBe(false);
-      expect(result.error.kind).toBe("archived");
+      const attachDeps = attachTargetDepsFrom(deps);
+      const openResult = await getOpenTerminalTarget(attachDeps, created.agent.id);
+      const attachResult = await getAttachTarget(attachDeps, created.agent.id);
+      expect(openResult.ok).toBe(false);
+      expect(openResult.error.kind).toBe("archived");
+      if (attachResult.ok) throw new Error("setup failed: attach-target unexpectedly succeeded");
+      expect(openResult).toStrictEqual(attachResult);
     });
   });
 
-  test("on agent with zero live sessions gets attach-target's identical 'no-live-session' refusal", async () => {
+  test("on agent with zero live sessions gets attach-target's identical 'no-live-session' refusal (byte-for-byte)", async () => {
     await withHarness(async ({ deps, liveSessions }) => {
       const created = await createAgent(deps, { name: "willdie" });
       if (!created.ok) throw new Error("setup failed");
       liveSessions.length = 0;
-      const result = await getOpenTerminalTarget(attachTargetDepsFrom(deps), created.agent.id);
-      expect(result.ok).toBe(false);
-      expect(result.error.kind).toBe("no-live-session");
+      const attachDeps = attachTargetDepsFrom(deps);
+      const openResult = await getOpenTerminalTarget(attachDeps, created.agent.id);
+      const attachResult = await getAttachTarget(attachDeps, created.agent.id);
+      expect(openResult.ok).toBe(false);
+      expect(openResult.error.kind).toBe("no-live-session");
+      if (attachResult.ok) throw new Error("setup failed: attach-target unexpectedly succeeded");
+      expect(openResult).toStrictEqual(attachResult);
     });
   });
 
