@@ -1,6 +1,10 @@
-// CNDLX-23: the eight-verb action set, as plain callable functions. No CLI,
-// no HTTP, no API, no UI — those are CNDLX-15's. `attach` is deliberately
-// NOT here — it is CNDLX-3's, left a seam.
+// CNDLX-23: the eight-verb action set, as plain callable functions.
+// CNDLX-32 (this file's only caller besides the reconcile loop, plus
+// src/api/server.ts) exposes these over a daemon HTTP API; no CLI, no
+// webapp yet — those are CNDLX-28/CNDLX-16's. `attach` (the exec-in-place
+// verb) is deliberately NOT here — it is CNDLX-28's; `attach-target` (R18's
+// query) lives in attach-target.ts instead, and `open-terminal`
+// (open-terminal.ts) is a seam for CNDLX-3.
 //
 // Every action follows the same shape: load the store (refusing outright on
 // `malformed` — never treated as empty, per CNDLX-17's own module doc),
@@ -46,14 +50,24 @@ export interface AgentActionsDeps {
   random: () => number;
 }
 
-/** Every action's first, shared refusal: a malformed store structurally cannot proceed (CNDLX-17's own reasoning, honoured here rather than re-decided). */
-export type StoreTrouble = { kind: "store-malformed"; error: string };
+/**
+ * Every action's first, shared refusal: a malformed store structurally
+ * cannot proceed (CNDLX-17's own reasoning, honoured here rather than
+ * re-decided). `message` is server-produced (CNDLX-27's R8 gap fix, section
+ * 2a): every refusal that reaches the wire carries a string a surface can
+ * show verbatim, alongside the existing structured `error` field.
+ */
+export type StoreTrouble = { kind: "store-malformed"; error: string; message: string };
 
 /** Every session-lookup step (off/archive/delete) can fail to even SEE reality — surfaced honestly rather than treated as "no session found". */
-export type SessionLookupTrouble = { kind: "session-lookup-failed"; error: string };
+export type SessionLookupTrouble = { kind: "session-lookup-failed"; error: string; message: string };
 
 /** A resolved session was found but could not be stopped/removed — never silently ignored. */
-export type SessionCleanupTrouble = { kind: "session-cleanup-failed"; failed: Array<{ id: string; error: string }> };
+export type SessionCleanupTrouble = {
+  kind: "session-cleanup-failed";
+  failed: Array<{ id: string; error: string }>;
+  message: string;
+};
 
 /**
  * The store write itself failed AFTER every effect already succeeded. The
@@ -61,7 +75,16 @@ export type SessionCleanupTrouble = { kind: "session-cleanup-failed"; failed: Ar
  * knows precisely how reality and the durable store may now disagree —
  * this is never swallowed and never left as an unhandled rejection.
  */
-export type StoreWriteTrouble = { kind: "store-write-failed"; error: string };
+export type StoreWriteTrouble = { kind: "store-write-failed"; error: string; message: string };
+
+/** Shared by createAgent (directory step). */
+export type DirectoryCreateTrouble = { kind: "directory-create-failed"; error: string; message: string };
+
+/** Shared by createAgent and turnOn (the spawn step). */
+export type SpawnTrouble = { kind: "spawn-failed"; error: string; message: string };
+
+/** deleteAgent's directory-removal step. */
+export type DirectoryRemovalTrouble = { kind: "directory-removal-failed"; reason: string; message: string };
 
 /**
  * Wraps every `saveAgentSet` call in this module. `effectDescription` is a
@@ -79,11 +102,13 @@ async function saveOrReportFailure(
     await saveAgentSet(agentSetPath, agentSet);
     return { ok: true };
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
       error: {
         kind: "store-write-failed",
-        error: `${effectDescription}, but the durable store write failed — the store may now be STALE relative to reality: ${err instanceof Error ? err.message : String(err)}`,
+        error: `${effectDescription}, but the durable store write failed — the store may now be STALE relative to reality: ${detail}`,
+        message: `${effectDescription}, but saving that change failed — the durable store may now be out of date relative to reality: ${detail}`,
       },
     };
   }
@@ -92,7 +117,10 @@ async function saveOrReportFailure(
 async function loadOrRefuse(agentSetPath: string): Promise<{ ok: true; agentSet: AgentSet } | { ok: false; error: StoreTrouble }> {
   const loaded = await loadAgentSet(agentSetPath);
   if (loaded.kind === "malformed") {
-    return { ok: false, error: { kind: "store-malformed", error: loaded.error } };
+    return {
+      ok: false,
+      error: { kind: "store-malformed", error: loaded.error, message: `the agent set store is malformed and cannot be used: ${loaded.error}` },
+    };
   }
   return { ok: true, agentSet: loaded.agentSet };
 }
@@ -116,10 +144,21 @@ async function stopSessionsOrTrouble(
   try {
     result = await stopAllSessionsUnderCwd(runCommand, cwd);
   } catch (err) {
-    return { ok: false, error: { kind: "session-lookup-failed", error: err instanceof Error ? err.message : String(err) } };
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      error: { kind: "session-lookup-failed", error: detail, message: `could not determine whether a live session exists under "${cwd}": ${detail}` },
+    };
   }
   if (result.failed.length > 0) {
-    return { ok: false, error: { kind: "session-cleanup-failed", failed: result.failed } };
+    return {
+      ok: false,
+      error: {
+        kind: "session-cleanup-failed",
+        failed: result.failed,
+        message: `${result.failed.length} live session(s) under "${cwd}" could not be stopped: ${result.failed.map((f) => `${f.id} (${f.error})`).join("; ")}`,
+      },
+    };
   }
   return { ok: true };
 }
@@ -153,8 +192,9 @@ export type CreateAgentError =
   | { kind: "invalid-name"; message: string }
   | { kind: "reserved-name"; word: string; message: string }
   | { kind: "name-taken"; holder: AgentRecord; message: string }
-  | { kind: "directory-create-failed"; error: string }
-  | { kind: "spawn-failed"; error: string }
+  | { kind: "invalid-job"; message: string }
+  | DirectoryCreateTrouble
+  | SpawnTrouble
   | StoreWriteTrouble;
 
 export type CreateAgentResult = { ok: true; agent: AgentRecord } | { ok: false; error: CreateAgentError };
@@ -181,6 +221,21 @@ export async function createAgent(deps: AgentActionsDeps, params: CreateAgentPar
     }
   }
 
+  // CNDLX-33 defect 3 / R3: `job` is create-only, and where it is ABSENT the
+  // `--append-system-prompt` flag is omitted entirely (agent-spawn.ts) —
+  // but an empty or whitespace-only string is PRESENT, not absent, and was
+  // reaching spawn as `--append-system-prompt ""`. Refused here (the epic's
+  // stated preference, R3's own reasoning: an operator who typed an empty
+  // job probably meant something, and saying so beats silently dropping it)
+  // rather than in the HTTP handler alone, so every direct `createAgent`
+  // caller — not only the wire path — gets the same guarantee.
+  if (params.job !== undefined && params.job.trim().length === 0) {
+    return {
+      ok: false,
+      error: { kind: "invalid-job", message: `"job" must not be empty or whitespace-only when present — omit it entirely instead` },
+    };
+  }
+
   const id = mintAgentId({ now: deps.now, random: deps.random });
   const record: AgentRecord = {
     id,
@@ -198,20 +253,22 @@ export async function createAgent(deps: AgentActionsDeps, params: CreateAgentPar
     // id-already-used / id-retired / invalid-id: structurally unreachable for
     // a fresh mintAgentId() output against the set we just loaded it against,
     // but surfaced honestly rather than assumed away.
-    return { ok: false, error: { kind: "store-malformed", error: `unexpected insertAgent refusal for a freshly minted id: ${err.kind}` } };
+    const detail = `unexpected insertAgent refusal for a freshly minted id: ${err.kind}`;
+    return { ok: false, error: { kind: "store-malformed", error: detail, message: detail } };
   }
 
   try {
     await createAgentDirectory(deps.agentDirectoryPath(id));
   } catch (err) {
-    return { ok: false, error: { kind: "directory-create-failed", error: err instanceof Error ? err.message : String(err) } };
+    const detail = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: { kind: "directory-create-failed", error: detail, message: `could not create the agent's directory: ${detail}` } };
   }
 
   if (initialState === "on") {
     const spawnResult = await spawnDaemonAgent(record, deps.agentDirectoryPath(id), deps.mcpConfigPath(id), { runCommand: deps.runCommand });
     if (!spawnResult.ok) {
       await removeAgentDirectory(deps.agentsBaseDir, id); // best-effort: nothing was ever persisted to the store, so this is the only rollback needed.
-      return { ok: false, error: { kind: "spawn-failed", error: spawnResult.error } };
+      return { ok: false, error: { kind: "spawn-failed", error: spawnResult.error, message: `the agent's directory was created but starting a session failed: ${spawnResult.error}` } };
     }
   }
 
@@ -245,7 +302,7 @@ export type OnAgentError =
   | StoreTrouble
   | ResolveAgentError
   | { kind: "already-archived"; message: string }
-  | { kind: "spawn-failed"; error: string }
+  | SpawnTrouble
   | StoreWriteTrouble;
 export type OnAgentSuccess = { kind: "no-change" } | { kind: "turned-on" };
 export type OnAgentResult = { ok: true; outcome: OnAgentSuccess } | { ok: false; error: OnAgentError };
@@ -260,7 +317,9 @@ export async function turnOn(deps: AgentActionsDeps, query: string): Promise<OnA
   if (decision.kind === "refused") return { ok: false, error: { kind: "already-archived", message: decision.message } };
 
   const spawnResult = await spawnDaemonAgent(agent, deps.agentDirectoryPath(agent.id), deps.mcpConfigPath(agent.id), { runCommand: deps.runCommand });
-  if (!spawnResult.ok) return { ok: false, error: { kind: "spawn-failed", error: spawnResult.error } };
+  if (!spawnResult.ok) {
+    return { ok: false, error: { kind: "spawn-failed", error: spawnResult.error, message: `starting a session failed: ${spawnResult.error}` } };
+  }
 
   const updated: AgentRecord = { ...agent, state: "on" };
   const saved = await saveOrReportFailure(
@@ -418,7 +477,8 @@ export async function renameAgent(deps: Pick<AgentActionsDeps, "agentSetPath">, 
     if (err.kind === "name-taken") return { ok: false, error: { kind: "name-taken", holder: err.holder, message: err.message } };
     if (err.kind === "invalid-name") return { ok: false, error: { kind: "invalid-name", message: err.message } };
     // not-found: structurally unreachable — `agent` was just resolved from this exact `agentSet`.
-    return { ok: false, error: { kind: "store-malformed", error: "renameAgent refused 'not-found' for an agent just resolved from the same set" } };
+    const detail = "renameAgent refused 'not-found' for an agent just resolved from the same set";
+    return { ok: false, error: { kind: "store-malformed", error: detail, message: detail } };
   }
 
   const saved = await saveOrReportFailure(deps.agentSetPath, renamed.agentSet, "the name was accepted");
@@ -435,7 +495,7 @@ export type DeleteAgentError =
   | ResolveAgentError
   | SessionLookupTrouble
   | SessionCleanupTrouble
-  | { kind: "directory-removal-failed"; reason: string }
+  | DirectoryRemovalTrouble
   | StoreWriteTrouble;
 
 export type DeleteAgentSuccess = { kind: "deleted" };
@@ -470,21 +530,40 @@ export async function deleteAgent(deps: AgentActionsDeps, query: string): Promis
   try {
     sessionResult = await stopAndRemoveAllSessionsUnderCwd(deps.runCommand, deps.agentDirectoryPath(agent.id));
   } catch (err) {
-    return { ok: false, error: { kind: "session-lookup-failed", error: err instanceof Error ? err.message : String(err) } };
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      error: {
+        kind: "session-lookup-failed",
+        error: detail,
+        message: `could not determine whether a live session exists for this agent: ${detail}`,
+      },
+    };
   }
   if (sessionResult.failed.length > 0) {
-    return { ok: false, error: { kind: "session-cleanup-failed", failed: sessionResult.failed } };
+    return {
+      ok: false,
+      error: {
+        kind: "session-cleanup-failed",
+        failed: sessionResult.failed,
+        message: `${sessionResult.failed.length} live session(s) could not be stopped/removed: ${sessionResult.failed.map((f) => `${f.id} (${f.error})`).join("; ")}`,
+      },
+    };
   }
 
   const dirResult = await removeAgentDirectory(deps.agentsBaseDir, agent.id);
   if (!dirResult.ok) {
-    return { ok: false, error: { kind: "directory-removal-failed", reason: dirResult.reason } };
+    return {
+      ok: false,
+      error: { kind: "directory-removal-failed", reason: dirResult.reason, message: `removing the agent's directory failed: ${dirResult.reason}` },
+    };
   }
 
   const deleted = deleteAgentMutator(agentSet, agent.id);
   if (!deleted.ok) {
     // structurally unreachable: `agent` was just resolved from this exact `agentSet`.
-    return { ok: false, error: { kind: "store-malformed", error: "deleteAgent refused 'not-found' for an agent just resolved from the same set" } };
+    const detail = "deleteAgent refused 'not-found' for an agent just resolved from the same set";
+    return { ok: false, error: { kind: "store-malformed", error: detail, message: detail } };
   }
 
   const saved = await saveOrReportFailure(

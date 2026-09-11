@@ -93,6 +93,21 @@ export function healthSignalPath(inputs: XdgInputs): string {
 }
 
 /**
+ * CNDLX-27/CNDLX-32: the daemon API's Unix domain socket. The ONE function
+ * both the daemon (which binds it) and any client (the CLI, CNDLX-28) call
+ * to find it, so the two surfaces cannot disagree about where the socket
+ * is — same discipline as `agentMcpConfigPath`/`agentDirectoryPath` above.
+ * Lives under the runtime dir, not the state dir: the socket is
+ * candlestix's own ephemeral entry point for THIS running daemon process,
+ * not durable state — a dead daemon's stale socket file is meaningless
+ * without a live process behind it (see api/server.ts's startup check),
+ * exactly like the registry and health signal already here.
+ */
+export function apiSocketPath(inputs: XdgInputs): string {
+  return join(candlestixRuntimeDir(inputs), "api.sock");
+}
+
+/**
  * R16: the id-keyed, id-validated per-agent MCP config path for a
  * daemon-created agent. Still lives under the runtime dir (an MCP config is
  * regenerated at spawn, not durable state — the runtime/durable split

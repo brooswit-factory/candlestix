@@ -16,3 +16,18 @@ jobs:
       - run: bun run typecheck
       - run: bun test
       - run: bun run build
+  # CNDLX-20: `engines.bun` declares the actual floor (>=1.3.11, the target
+  # laptop's real version) — this job is the load-bearing half of that
+  # claim. A changed number with no gate pinned to it just moves the
+  # untested claim from one place to another; this job is what actually
+  # fails if something in this tree comes to depend on a newer bun API.
+  check-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: "1.3.11" }
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
