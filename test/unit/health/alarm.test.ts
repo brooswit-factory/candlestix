@@ -63,12 +63,35 @@ describe("startStalenessAlarm", () => {
   // silently end every future tick. Fails if only one tick's worth of
   // calls is observed instead of several, or if the process actually
   // crashes (the test runner itself would report that).
+  //
+  // This drives the real `startStalenessAlarm` on the real system clock —
+  // deliberately, so the assertion proves the alarm actually fires on its
+  // own schedule with nobody polling it, not just that a mock was called.
+  // CNDLX-37: rather than sleep a fixed window and then count ticks (which
+  // made the assertion a function of OS scheduler jitter — see the ticket
+  // for the measured flake), wait for the ticks themselves, with a ceiling
+  // far past any plausible stall. Scheduler jitter can now only make this
+  // slower, never wrong: REQUIRED_TICKS is reached in ~30ms when the
+  // machine is idle, and however long a stalled scheduler needs under
+  // load, right up to the ceiling. The only way to hit the ceiling is
+  // either the process being starved of CPU for multiple seconds straight
+  // (which would be failing the rest of the suite too, not just this
+  // test) or a real defect that stopped the timer after the first throw —
+  // exactly the regression this test exists to catch.
   test("keeps ticking on its own schedule even after onStale throws", async () => {
     const store = createHeartbeatStore();
     store.recordHeartbeat("dead-loop", new Date(0));
     const thresholdMs = 1;
 
+    const REQUIRED_TICKS = 3;
+    const TICK_WAIT_CEILING_MS = 5_000;
+
     let calls = 0;
+    let resolveTicksObserved: () => void = () => {};
+    const ticksObserved = new Promise<void>((resolve) => {
+      resolveTicksObserved = resolve;
+    });
+
     const alarm = startStalenessAlarm({
       store,
       intervalMs: 10,
@@ -76,13 +99,23 @@ describe("startStalenessAlarm", () => {
       now: () => new Date(),
       onStale: () => {
         calls += 1;
+        if (calls === REQUIRED_TICKS) resolveTicksObserved();
         throw new Error("a misbehaving onStale, e.g. a paging integration that fails");
       },
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 55));
+    let ceilingTimer: ReturnType<typeof setTimeout> | undefined;
+    const ceiling = new Promise<void>((resolve) => {
+      ceilingTimer = setTimeout(resolve, TICK_WAIT_CEILING_MS);
+    });
+    await Promise.race([ticksObserved, ceiling]);
+    clearTimeout(ceilingTimer);
     alarm.stop();
 
-    expect(calls).toBeGreaterThanOrEqual(3);
+    // Equivalent strength to the original "≥3 ticks happened": we now wait
+    // until 3 ticks happen or the ceiling elapses, so a defect that stops
+    // ticking after the first throw still leaves `calls` below 3 here and
+    // this still fails.
+    expect(calls).toBeGreaterThanOrEqual(REQUIRED_TICKS);
   });
 });

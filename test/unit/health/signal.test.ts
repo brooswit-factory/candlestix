@@ -98,6 +98,15 @@ describe("startHealthSignalWriter", () => {
   // verified empirically while building this) or permanently stop the
   // writer. Fails if onError is only ever called once instead of on every
   // tick, or if the process crashes outright.
+  //
+  // This drives the real `startHealthSignalWriter` on the real system
+  // clock — deliberately, so the assertion proves the writer actually
+  // keeps ticking on its own schedule with nobody polling it, not just
+  // that a mock was called. CNDLX-37: rather than sleep a fixed window and
+  // then count ticks (a shape measured flaky under load — see the ticket),
+  // wait for the ticks themselves, with a ceiling far past any plausible
+  // stall. See alarm.test.ts's matching test for the full justification of
+  // why scheduler jitter can only make this slower, never wrong.
   test("keeps ticking on schedule and routes a synchronous throw to onError instead of crashing", async () => {
     const dir = await mkdtemp(join(tmpdir(), "candlestix-health-test-"));
     const path = join(dir, "health.json");
@@ -109,7 +118,15 @@ describe("startHealthSignalWriter", () => {
         getHeartbeat: () => ({ tracked: false, lastHeartbeat: null, displayName: undefined }),
       };
 
+      const REQUIRED_TICKS = 3;
+      const TICK_WAIT_CEILING_MS = 5_000;
+
       let errors = 0;
+      let resolveTicksObserved: () => void = () => {};
+      const ticksObserved = new Promise<void>((resolve) => {
+        resolveTicksObserved = resolve;
+      });
+
       const writer = startHealthSignalWriter({
         store: throwingStore,
         path,
@@ -117,13 +134,23 @@ describe("startHealthSignalWriter", () => {
         thresholdMs: THRESHOLD_MS,
         onError: () => {
           errors += 1;
+          if (errors === REQUIRED_TICKS) resolveTicksObserved();
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 55));
+      let ceilingTimer: ReturnType<typeof setTimeout> | undefined;
+      const ceiling = new Promise<void>((resolve) => {
+        ceilingTimer = setTimeout(resolve, TICK_WAIT_CEILING_MS);
+      });
+      await Promise.race([ticksObserved, ceiling]);
+      clearTimeout(ceilingTimer);
       writer.stop();
 
-      expect(errors).toBeGreaterThanOrEqual(3);
+      // Equivalent strength to the original "≥3 errors happened": we now
+      // wait until 3 errors happen or the ceiling elapses, so a defect
+      // that stops ticking after the first throw still leaves `errors`
+      // below 3 here and this still fails.
+      expect(errors).toBeGreaterThanOrEqual(REQUIRED_TICKS);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
