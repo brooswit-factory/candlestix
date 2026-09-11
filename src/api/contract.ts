@@ -107,8 +107,12 @@ export const API_ROUTES: Record<ApiRouteName, ApiRouteDef> = {
 export type UnknownRouteError = { kind: "unknown-route"; method: string; path: string; message: string };
 export type MalformedJsonError = { kind: "malformed-json"; message: string };
 export type InvalidRequestBodyError = { kind: "invalid-request-body"; message: string };
+/** CNDLX-33 defect 1a: `{idOrName}` failed to `decodeURIComponent` — a malformed percent-escape, never reachable as an HTML 500 page. */
+export type MalformedPathError = { kind: "malformed-path"; message: string };
+/** CNDLX-33 defect 1b: the catch-all for any unexpected throw on the request path — logged server-side (src/log.ts), never a stack trace to the client. */
+export type InternalServerError = { kind: "internal-error"; message: string };
 
-export type ApiServerError = UnknownRouteError | MalformedJsonError | InvalidRequestBodyError;
+export type ApiServerError = UnknownRouteError | MalformedJsonError | InvalidRequestBodyError | MalformedPathError | InternalServerError;
 
 // ---------------------------------------------------------------------------
 // Status mapping — "a coarse hint, not the contract" (CNDLX-27 section 2):
@@ -136,6 +140,8 @@ const ERROR_STATUS: Record<AnyActionError["kind"] | ApiServerError["kind"], numb
   "unknown-route": 404,
   "malformed-json": 400,
   "invalid-request-body": 400,
+  "malformed-path": 400,
+  "invalid-job": 400,
   // 5xx — daemon-side trouble: the store, a session lookup/cleanup, a
   // directory operation, or spawning a session failed. None of these are
   // the client's fault or fixable by changing the request.
@@ -146,6 +152,7 @@ const ERROR_STATUS: Record<AnyActionError["kind"] | ApiServerError["kind"], numb
   "directory-create-failed": 500,
   "spawn-failed": 500,
   "directory-removal-failed": 500,
+  "internal-error": 500,
 };
 
 /** Pure: kind in, HTTP status out. Exhaustive over the same two kind-unions `ERROR_STATUS` is keyed by — a kind missing from either fails `bun run typecheck`. */

@@ -19,6 +19,18 @@ no "Done." That is the whole reason it is a separate product from `butchr`
 
 ## Status
 
+**CNDLX-33 landed: three defects CNDLX-27's own epic review found in the
+daemon API are fixed.** A malformed percent-escape in `{idOrName}`, and
+any other unexpected throw on the request path, now return typed JSON
+(`malformed-path` 400, `internal-error` 500) — never `Bun.serve`'s default
+HTML page (previously true of both). `POST /v1/agents` and `.../rename`
+now reject any body that isn't empty-or-an-object-with-only-the-expected-
+keys, so a bare string/number/array/`null`, or a typo'd field name, can no
+longer mint an agent and spawn a session (`invalid-request-body`, naming
+what was wrong). An empty or whitespace-only `job` is refused
+(`invalid-job`) rather than reaching spawn as `--append-system-prompt ""`
+(R3). See "The daemon API" and "Demonstrations — CNDLX-33" below.
+
 **CNDLX-32 landed: the daemon exposes the whole action set over a local
 Unix socket.** The eight-verb lifecycle action set, `attach-target` (R18's
 query), and the `open-terminal` seam are all reachable over HTTP-over-a-
@@ -412,6 +424,20 @@ run with the process's `cwd` set to the agent's own directory
 passed an empty string — since `job` is optional on a daemon-created
 agent, unlike a roster entry's (which was required).
 
+**CNDLX-33 defect 3:** an empty or whitespace-only `job` is *present*, not
+absent, and `spawnDaemonAgent` itself only ever checked `!== undefined` —
+so before this fix it reached spawn as `--append-system-prompt ""`,
+violating R3 (job absent means the flag is omitted, not passed empty).
+Fixed at `createAgent` (`agent-actions.ts`), the core layer both the API
+and any direct caller go through — not in the HTTP handler alone: an
+empty or whitespace-only `job` is now refused as a typed `invalid-job`
+before an id is even minted. **Chose refuse over silently normalizing to
+absent** (the epic's own stated preference): an operator who typed an
+empty job probably meant something, and saying so beats silently
+dropping it. A record with `job: ""` can therefore no longer be created
+through this path; see "Known gaps" for the one path this does not cover
+(a hand-edited or pre-this-fix store entry).
+
 ### Why `claude --bg`
 
 Verified live rather than assumed from `--help` text: `claude --bg` needs
@@ -665,6 +691,8 @@ POST /v1/agents  { bad json  → 400 {"ok":false,"error":{"kind":"malformed-json
 POST .../@notreal.../on      → 404 {"ok":false,"error":{"kind":"not-found","query":"@notreal00000000000","message":"no agent found named \"@notreal00000000000\""}}
 ```
 
+**CNDLX-33 re-ran this section against two defects the epic found this shape did NOT yet cover — see "Demonstrations — CNDLX-33" below for the full re-run:** a malformed percent-escape in `{idOrName}` (previously a bare HTML 500 from an unguarded `decodeURIComponent`) and any other unexpected throw on the request path (previously the same HTML page, from `Bun.serve` having no `error` handler at all). Both are now this same typed JSON shape — `malformed-path` (400) and `internal-error` (500) — never an HTML page, on every route.
+
 **4. Single-writer serialization, for real, not just the unit test's
 generic critical section:** 15 concurrent `POST /v1/agents` fired as
 background shell jobs against the SAME live socket, `wait`ed, then `GET
@@ -739,6 +767,87 @@ Bundled 30 modules in 7ms
 ```
 
 `package.json` still has no `dependencies` key.
+
+## Demonstrations — CNDLX-33 (fix epic review findings)
+
+Run 2026-09-11, driving `startApiServer` (`src/api/server.ts`) directly over
+a **real Unix socket**, scratch XDG-shaped temp dirs, a stubbed
+`runCommand` that throws loudly rather than silently succeeding if ever
+actually invoked (never touched, said plainly, in either check below). Every
+check states the failure condition before running it. This is the same
+"error shapes" section CNDLX-32 demonstrated (see above), re-run with the
+two new cases this task adds.
+
+**1. The malformed percent-escape (defect 1a).** Failure condition: an HTML
+body, a non-400 status, or any `kind` other than `malformed-path`.
+
+```
+GET  /v1/agents/%E0%A4%A/attach-target
+  -> 400 application/json
+  {"ok":false,"error":{"kind":"malformed-path","message":"the path segment \"%E0%A4%A\" is not a valid percent-encoded value: URI error"}}
+POST /v1/agents/%E0%A4%A/on
+  -> 400 application/json
+  {"ok":false,"error":{"kind":"malformed-path","message":"the path segment \"%E0%A4%A\" is not a valid percent-encoded value: URI error"}}
+```
+
+**Control**, same run, immediately after: a validly-escaped but unknown
+`idOrName` on the identical route still gets its normal typed 404, proving
+the 400 above is specific to the decode failure, not a change to
+not-found's own behaviour:
+
+```
+GET  /v1/agents/%40nope/attach-target
+  -> 404 application/json
+  {"ok":false,"error":{"kind":"not-found","query":"@nope","message":"no agent found named \"@nope\""}}
+```
+
+**2. The catch-all (defect 1b).** An injected fault — `mcpConfigPath`
+throwing synchronously, a dependency nothing in `agent-actions.ts` wraps in
+its own try/catch — reaching `createAgent` via a real `POST /v1/agents`.
+Failure condition: the response contains the injected string
+(`"injected-fault: ..."`), any stack-trace-shaped text, a status other than
+500, or nothing appearing in the daemon's own log.
+
+```
+[server stderr] [2026-09-11T07:12:17.221Z] ERROR unhandled error handling POST http://localhost/v1/agents: Error: injected-fault: mcpConfigPath threw instead of returning a path
+    at mcpConfigPath (.../live-demo-defects.ts:28:17)
+    at createAgent (src/agent-actions.ts:268:90)
+
+POST /v1/agents {"name":"demo"}
+  -> 500 application/json
+  {"ok":false,"error":{"kind":"internal-error","message":"an unexpected internal error occurred; see the daemon's own log for detail"}}
+```
+
+The full detail (message + stack) reached the log; **none of it — not the
+injected string, not a stack frame — reached the response body.**
+
+**Control**, same run, same socket, immediately after: `GET /v1/agents` (a
+route that never calls `mcpConfigPath`) still answers normally:
+
+```
+GET  /v1/agents -> 200 application/json {"ok":true,"agents":[]}
+```
+
+**3. Defect 2 (strict create/rename body shape) and defect 3 (R3's
+empty-job rule)** are demonstrated exhaustively as unit tests
+(`test/unit/api/server.test.ts`'s two new `describe` blocks, and
+`test/unit/agent-actions.test.ts`'s "R11" block) rather than repeated here
+live — every row of the epic's own repro table, each with a control, plus
+the "a rejected body spawns nothing" assertion on recorded commands the
+epic explicitly required (not inferred from the status code). Chose to
+show 1a/1b live here specifically because they are the two cases that
+previously escaped the JSON error shape entirely (an HTML page) — the
+thing this section exists to prove is fixed.
+
+**Suite/typecheck/build on this branch:** `bun run check` → **357 pass, 0
+fail** (337 inherited + 20 new), typecheck clean, build clean. The two
+exhaustiveness mechanisms were verified live, not just asserted, the same
+way CNDLX-27/32 verified theirs: `ERROR_STATUS` (`src/api/contract.ts`)
+with `"malformed-path": 400` temporarily deleted failed `bun run
+typecheck` with `TS2741: Property '"malformed-path"' is missing in type
+...`, naming exactly that kind; restoring it passed. `ALL_WIRE_ERROR_KINDS`
+(`src/error-wire-format.ts`) with `"invalid-job"` temporarily deleted
+failed the same way (`TS2345`); restored, passed.
 
 ## systemd user unit (`systemd/candlestix.service`)
 
@@ -923,7 +1032,10 @@ in-place `attach` is still not built (also CNDLX-28's) — though R18's
   the store write only after every effect has succeeded** — and when the
   store write itself then fails, report a typed `store-write-failed`
   naming exactly which effect already happened, rather than leaving an
-  unhandled rejection or a silently-stale record.
+  unhandled rejection or a silently-stale record. `createAgent` also
+  refuses an empty/whitespace-only `job` as a typed `invalid-job`
+  (CNDLX-33 defect 3, R3) — before minting an id, so no directory or
+  session is ever touched for a refused create.
 
 ## The daemon API (`src/api/`, `src/attach-target.ts`, `src/open-terminal.ts`, `src/mutation-queue.ts`)
 
@@ -1001,6 +1113,19 @@ restating.
 | GET | `/v1/agents/{idOrName}/attach-target` | — | the R18 attach query |
 | POST | `/v1/agents/{idOrName}/open-terminal` | — | the window-opening seam for CNDLX-3 |
 
+**Every body above is checked for shape, not just field types (CNDLX-33
+defect 2).** A body is either absent (meaning `{}`) or a JSON object whose
+keys are a subset of the ones listed — a bare string/number/array/`null`,
+or an object with an unrecognized key (a typo'd field name), is a typed
+`invalid-request-body` naming exactly what was wrong, **before** any
+create/rename is attempted. Before this fix, `createAgent`'s handler did
+`bodyResult.body ?? {}` and read `.name`/`.job` off whatever survived that
+— a string, number, array, or `null` body all minted an agent and spawned
+a session, and a misspelled key (`{"nmae":"typo"}`) silently produced an
+unnamed agent rather than reporting the typo. **A rejected body now spawns
+nothing**, verified on recorded commands, not inferred from the status
+code (`test/unit/api/server.test.ts`).
+
 ### The response body IS the action's own result union
 
 Serialized as-is: `{ok:true, ...}` or `{ok:false, error:{kind, message, ...}}`.
@@ -1013,20 +1138,38 @@ it:
 | status | when |
 |---|---|
 | 200 | every `ok:true` |
-| 400 | `invalid-name`, `invalid-request-body`, `malformed-json` |
+| 400 | `invalid-name`, `invalid-request-body`, `malformed-json`, `malformed-path`, `invalid-job` |
 | 404 | `not-found` (unknown id-or-name), `unknown-route` |
 | 409 | `ambiguous`, `name-taken`, `already-archived`, `archived`, `not-archived`, `off`, `no-live-session`, `multiple-live-sessions` — every state-conflict refusal |
 | 501 | `not-implemented` (open-terminal, honestly) |
-| 500 | `store-malformed`, `store-write-failed`, `session-lookup-failed`, `session-cleanup-failed`, `directory-create-failed`, `spawn-failed`, `directory-removal-failed` — daemon-side trouble, never the client's fault |
+| 500 | `store-malformed`, `store-write-failed`, `session-lookup-failed`, `session-cleanup-failed`, `directory-create-failed`, `spawn-failed`, `directory-removal-failed`, `internal-error` — daemon-side trouble, never the client's fault |
+
+**`malformed-path` (CNDLX-33 defect 1a) and `internal-error` (CNDLX-33
+defect 1b)** are new in this task: a malformed percent-escape in
+`{idOrName}` and a catch-all around every unexpected throw on the request
+path, respectively — both previously reached the client as `Bun.serve`'s
+own default HTML error page, never this table. `internal-error` **logs
+the real detail server-side (`src/log.ts`) and never returns it, or a
+stack trace, to the client** — see "Demonstrations — CNDLX-33" below.
+`invalid-job` (CNDLX-33 defect 3) is `createAgent`'s own refusal of an
+empty/whitespace-only `job`, part of `CreateAgentError` rather than this
+API layer's own `ApiServerError` — same table, same enforcement.
 
 The exact mapping is `src/api/contract.ts`'s `statusForErrorKind`, a pure
 function kept exhaustive over the same two kind-unions
 `error-wire-format.ts` enumerates (see below) — a kind missing from either
 fails `bun run typecheck`.
 
-An **unknown route** or a **malformed JSON body** gets this same JSON
-error shape, never an HTML page, an empty body, or a bare framework 404 —
-see `test/unit/api/server.test.ts`.
+An **unknown route**, a **malformed JSON body**, a **malformed
+percent-escape in `{idOrName}`**, or **any other unexpected throw
+anywhere on the request path** gets this same JSON error shape, never an
+HTML page, an empty body, or a bare framework 404 or 500 — see
+`test/unit/api/server.test.ts`. The last of these is enforced by a
+catch-all wrapping every request (`handleRequest` in `src/api/server.ts`,
+plus `Bun.serve`'s own `error` option as defense-in-depth): **this claim
+used to be false** — before CNDLX-33, `Bun.serve` was constructed with no
+`error` handler at all and the route matcher's `decodeURIComponent` was
+unguarded, so both cases reached the client as Bun's default HTML page.
 
 ### Every refusal carries a server-produced `message` (R8's gap, closed)
 
@@ -1258,6 +1401,18 @@ addressed here, explicitly, per this story's own acceptance criteria:
   like a gap at a glance and is in fact a deliberate ruling: what two
   simultaneous `claude attach` clients actually do is Claude Code's own
   behaviour, measured by CNDLX-28, not this task.
+- **CNDLX-33's `invalid-job` refusal is enforced at `createAgent`
+  (create-time), not at `spawnDaemonAgent` (every spawn).** R3 says `job`
+  is set at create-only and nothing in this codebase mutates it after
+  that, so this is sufficient for every path that ever calls
+  `createAgent` — but the agent-set store's own deserializer
+  (`agent-set.ts`) still accepts any string for `job`, including `""`, so
+  a hand-edited `agents.json`, or a record created before this fix
+  shipped, could still hold `job: ""` and would still reach spawn as
+  `--append-system-prompt ""` the next time `turnOn` re-spawns it. Out of
+  scope for this task, which is about the wire-reachable create defect
+  the epic named — flagged here rather than silently left for a future
+  reader to rediscover.
 
 ## Tooling
 
