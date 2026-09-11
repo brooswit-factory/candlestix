@@ -35,8 +35,9 @@ what was wrong). An empty or whitespace-only `job` is refused
 Unix socket.** The eight-verb lifecycle action set, `attach-target` (R18's
 query), and the `open-terminal` seam are all reachable over HTTP-over-a-
 Unix-domain-socket — see "The daemon API" below for the transport
-reasoning, the route table, and the demonstration. The CLI (CNDLX-28) is
-being built in parallel against this exact contract; the webapp (CNDLX-16)
+reasoning, the route table, and the demonstration. The `candlestix` CLI
+(CNDLX-28/CNDLX-31) is a real, working thin client of this exact
+contract now — see "The candlestix CLI" below; the webapp (CNDLX-16)
 comes after. `open-terminal` itself is still an honest seam — CNDLX-3
 implements actually opening a window.
 
@@ -751,7 +752,9 @@ fabricating health) and is **not** evidence about attach-target, which
 does not consult pid liveness at all — only that a live `claude agents
 --json` entry exists under the agent's directory, which the stub does
 provide honestly. The real-session case (a genuine `claude --bg` process
-staying alive) is CNDLX-28's to demonstrate, not this task's.
+staying alive) is demonstrated for real by CNDLX-31 — see "The real
+end-to-end demonstration" under "The candlestix CLI" below — not by this
+section's own, deliberately stubbed run.
 
 **Host confirmed back at baseline** after this demonstration: all three
 demo daemon processes stopped (`ps aux` checked — the two other
@@ -1007,9 +1010,11 @@ above: the eight verbs — `create`, `on`, `off`, `rename`, `archive`,
 CNDLX-19, the state these verbs write is exactly what the reconcile loop
 reads** — see "Supervisor loop" above. **As of CNDLX-32, these are also
 exactly the functions the daemon API calls** — see "The daemon API"
-below. Still no CLI, no webapp (CNDLX-28/16's scope), and the CLI's
-in-place `attach` is still not built (also CNDLX-28's) — though R18's
-`attach-target` query and the `open-terminal` seam both are, see below.
+below. **As of CNDLX-30/CNDLX-31, the `candlestix` CLI is a thin client of
+that same API**, including a real, working in-place `attach` (see "The
+candlestix CLI" below) — R18's `attach-target` query and the
+`open-terminal` seam are both built too, see below. No webapp yet
+(CNDLX-16's scope).
 
 - **`agent-lifecycle.ts`** — the PURE transition rules (R9): `decideOn`/
   `decideOff`/`decideArchive`/`decideUnarchive`/`decideDelete`, each a
